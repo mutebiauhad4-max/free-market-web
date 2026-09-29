@@ -65,7 +65,7 @@ function fmgId(prefix) {
    never breaks because of this layer. */
 
 let fmgDB = null;
-let fmgCloudReady = true;
+let fmgCloudReady = false;
 
 function fmgNotifyUpdated(key) {
   document.dispatchEvent(new CustomEvent("fmg:updated", { detail: { key } }));
