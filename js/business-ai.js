@@ -1,492 +1,278 @@
-/* ============================================================
-   CAMPUS MARKET — data.js
-   Shared data layer. By default everything is stored in the
-   browser via localStorage, which is enough to demo the site on
-   one device but is never shared between devices or browsers.
+/* ==========================================================================
+   BUSINESS AI — in-site assistant powered by Google Gemini (see ai-config.js)
+   - Answers business / shopping questions without the visitor leaving the site
+   - Can look at a product's picture (or a photo the shopper attaches)
+   - Remembers each shopper's conversation (per account, on this device)
+   ========================================================================== */
+(function () {
+  const CFG = (typeof BUSINESS_AI_CONFIG !== "undefined") ? BUSINESS_AI_CONFIG : { enabled: false };
+  const MAX_STORED = 60;      // messages kept in memory per shopper
+  const CONTEXT_TURNS = 14;   // recent messages sent to Gemini each time
+  let pendingImage = null;    // { mime, data(base64), label }
+  let busy = false;
 
-   If js/firebase-config.js has FMG_CLOUD_ENABLED set to true, this
-   file also mirrors products, businesses, users, orders and
-   feedback to a free shared Firestore database in the background,
-   so every device sees the same marketplace. See firebase-config.js
-   for the 5-minute setup. Every other file only ever calls the FMG
-   object below — none of them know or care whether the data behind
-   it is local-only or cloud-synced.
-   ============================================================ */
-
-const FMG_ADMIN = { name: "ADMIN GROUP A", password: "KU MASAKA" };
-
-const FMG_CATEGORIES = [
-  { id: "electronics", label: "Electronics", icon: "electronics" },
-  { id: "fashion", label: "Fashion", icon: "fashion" },
-  { id: "office", label: "Office", icon: "office" },
-  { id: "machinery", label: "Machinery", icon: "machinery" },
-  { id: "home", label: "Home & Living", icon: "home" },
-  { id: "agriculture", label: "Agriculture", icon: "agriculture" }
-];
-
-const FMG_LOCATIONS = [
-  { id: "masaka", label: "Masaka", lat: -0.3372, lng: 31.7345 },
-  { id: "ssembabule", label: "Ssembabule", lat: -0.0904, lng: 31.4534 },
-  { id: "kampala", label: "Kampala", lat: 0.3476, lng: 32.5825 },
-  { id: "gayaza", label: "Gayaza", lat: 0.4907, lng: 32.6167 },
-  { id: "kyotera", label: "Kyotera", lat: -0.6193, lng: 31.5253 },
-  { id: "kumasaka", label: "Kampala University Masaka", lat: -0.3406, lng: 31.7331 }
-];
-
-const FMG_FREE_TRIAL_LIMIT = 100;
-const FMG_FREE_TRIAL_MONTHS = 6;
-const FMG_MAX_DELIVERY_FEE = 10000; // UGX — hard cap a business can charge for delivery to any one point
-
-const FMG_PAYMENT_METHODS = [
-  { id: "momo", label: "MTN MoMo Pay", field: "number", fieldLabel: "MoMo phone number" },
-  { id: "airtel", label: "Airtel Pay", field: "number", fieldLabel: "Airtel phone number" },
-  { id: "mastercard", label: "Mastercard", field: "merchantId", fieldLabel: "Merchant ID" }
-];
-
-function fmgEmptyPaymentMethods() {
-  return {
-    momo: { enabled: false, number: "" },
-    airtel: { enabled: false, number: "" },
-    mastercard: { enabled: false, merchantId: "" }
-  };
-}
-
-/* ---------- tiny local "database" helpers ---------- */
-
-function fmgLoad(key, fallback) {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch (e) {
-    return fallback;
+  /* ---------- memory ---------- */
+  function memoryKey() {
+    const s = FMG.getSession();
+    if (s && s.id) return "fmg_ai_chat_" + s.type + "_" + s.id;
+    let g = localStorage.getItem("fmg_ai_guest_id");
+    if (!g) { g = "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); localStorage.setItem("fmg_ai_guest_id", g); }
+    return "fmg_ai_chat_guest_" + g;
   }
-}
-function fmgSave(key, value) {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch (e) {
-    console.error("Storage full or unavailable:", e);
+  function loadHistory() { try { return JSON.parse(localStorage.getItem(memoryKey())) || []; } catch (e) { return []; } }
+  function saveHistory(h) { try { localStorage.setItem(memoryKey(), JSON.stringify(h.slice(-MAX_STORED))); } catch (e) {} }
+
+  /* ---------- UI helpers ---------- */
+  const $ = id => document.getElementById(id);
+  function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+  function fmt(text) {   // safe mini-markdown: escape first, then **bold**, `-` bullets, line breaks
+    return esc(text).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/^\s*[-*]\s+/gm, "• ").replace(/\n/g, "<br>");
   }
-}
-function fmgId(prefix) {
-  return prefix + "_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-}
-
-/* ---------- optional cloud sync (Firestore) ----------
-   Off by default. Turned on by setting FMG_CLOUD_ENABLED = true in
-   js/firebase-config.js, which is loaded before this file. Everything
-   here fails silently back to local-only mode if that file is missing,
-   the flag is off, or the Firebase scripts didn't load — the site
-   never breaks because of this layer. */
-
-let fmgDB = null;
-let fmgCloudReady = false;
-
-function fmgNotifyUpdated(key) {
-  document.dispatchEvent(new CustomEvent("fmg:updated", { detail: { key } }));
-}
-
-function fmgWatchList(collectionName, localKey) {
-  fmgDB.collection(collectionName).onSnapshot(
-    snap => {
-      // An empty reading that came only from the browser's cache, or that arrives while this device
-      // still holds unsynced data, is not proof the cloud is empty: never let it wipe local data.
-      const localCount = (fmgLoad(localKey, []) || []).length;
-      if (snap.empty && ((snap.metadata && snap.metadata.fromCache) || (localCount > 0 && !fmgSeedOK[localKey]))) return;
-      const items = snap.docs.map(d => d.data());
-      fmgSave(localKey, items);
-      fmgNotifyUpdated(localKey);
-    },
-    err => console.error("Cloud sync (read) failed for", collectionName, err)
-  );
-}
-function fmgWatchMeta(docId, localKey, fallback) {
-  fmgDB.collection("fmg_meta").doc(docId).onSnapshot(
-    doc => {
-      if (!doc.exists && ((doc.metadata && doc.metadata.fromCache) || !fmgSeedOK[localKey])) return;
-      const value = doc.exists ? doc.data().value : fallback;
-      fmgSave(localKey, value);
-      fmgNotifyUpdated(localKey);
-    },
-    err => console.error("Cloud sync (read) failed for", docId, err)
-  );
-}
-
-function fmgSyncListToCloud(collectionName, previousList, newList) {
-  if (!fmgCloudReady) return;
-  const prevIds = new Set(previousList.map(x => x.id));
-  const newIds = new Set(newList.map(x => x.id));
-  newList.forEach(item => {
-    fmgDB.collection(collectionName).doc(String(item.id)).set(item)
-      .catch(err => console.error("Cloud sync (write) failed for", collectionName, item.id, err));
-  });
-  prevIds.forEach(id => {
-    if (!newIds.has(id)) {
-      fmgDB.collection(collectionName).doc(String(id)).delete()
-        .catch(err => console.error("Cloud sync (delete) failed for", collectionName, id, err));
+  function addBubble(role, text, opts) {
+    const body = $("baiBody");
+    const d = document.createElement("div");
+    d.className = "bai-msg " + role;
+    d.innerHTML = fmt(text);
+    if (opts && opts.imageSrc) { const im = document.createElement("img"); im.src = opts.imageSrc; d.prepend(im); }
+    body.appendChild(d);
+    body.scrollTop = body.scrollHeight;
+    return d;
+  }
+  function renderHistory() {
+    const body = $("baiBody");
+    body.innerHTML = "";
+    const h = loadHistory();
+    if (!h.length) {
+      addBubble("bot", "Hello, I'm the **Business AI**. Ask me about products, prices, which seller to choose, delivery, payments, or how to grow a small business. You can also attach a photo and I'll tell you what I see.");
+    } else {
+      h.forEach(m => { const b = addBubble(m.role === "user" ? "user" : "bot", m.text, m.hadImage ? {} : undefined); if (m.by) { const t = document.createElement("div"); t.className = "bai-by"; t.textContent = "via " + m.by; b.appendChild(t); } });
     }
+    $("baiClearBtn").style.display = h.length ? "" : "none";
+  }
+
+  /* ---------- marketplace knowledge sent as context ---------- */
+  function catalogueContext() {
+    const biz = FMG.getBusinesses();
+    const products = FMG.getProducts().slice(0, 60).map(p => {
+      const b = biz.find(x => x.id === p.bizId);
+      const price = p.discount ? Math.round(p.price * (1 - p.discount / 100)) : p.price;
+      return `- ${p.name} | ${FMG.categoryById(p.category)?.label || p.category} | UGX ${price}` +
+        (p.discount ? ` (${p.discount}% off)` : "") + ` | seller: ${b ? b.name : "unknown"}` +
+        (b ? ` (${FMG.locationById(b.location)?.label || ""})` : "") + (p.description ? ` | ${String(p.description).slice(0, 120)}` : "");
+    }).join("\n");
+    return products || "(no products listed yet)";
+  }
+  function systemPrompt() {
+    return [
+      "You are Business AI, the built-in assistant of CAMPUS MARKET, an online marketplace built by Group A, Kampala University Masaka, serving shoppers and small businesses in Uganda (prices in UGX).",
+      "Scope: ONLY business and shopping topics: products, comparing quality and value, pricing, choosing sellers, delivery and pickup, payments, running or growing a small business, marketing, stock, and customer service. Politely decline unrelated requests and steer back to business.",
+      "Style: professional, warm, concise (usually under 150 words). Use short bullet points for comparisons. Never invent products or prices: for items sold on CAMPUS MARKET use ONLY the catalogue below; for general market knowledge say it is general guidance.",
+      "Platform facts: payment methods are MTN MoMo, Airtel Pay and Mastercard and the checkout only offers methods every seller in the cart accepts; delivery fee per product never exceeds UGX 10,000; shoppers can use 'Message seller' on a product page; registering a business is free for the first 100 sign-ups for 6 months.",
+      "If asked to look at an image, describe what is visible and relate it to buying, quality, or selling advice. Do not claim certainty about authenticity or exact condition from a photo.",
+      "CURRENT CATALOGUE:\n" + catalogueContext()
+    ].join("\n\n");
+  }
+
+  /* ---------- provider router (many free AI services, automatic fallback) ---------- */
+  function isActive(p) {
+    if (CFG.proxyUrl && p.viaProxy) return true;
+    return !!(p.apiKey && String(p.apiKey).trim());
+  }
+  function activeProviders() { return (CFG.providers || []).filter(isActive); }
+  function aiReady() { return CFG.enabled && activeProviders().length > 0; }
+  let rr = 0;   // rotates the first choice in "spread" mode
+
+  async function fetchJSON(url, headers, body) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), CFG.timeoutMs || 20000);
+    try {
+      const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: ctl.signal });
+      if (!r.ok) { const tx = await r.text().catch(() => ""); const e = new Error("HTTP " + r.status + " " + tx.slice(0, 160)); e.status = r.status; throw e; }
+      return await r.json();
+    } finally { clearTimeout(t); }
+  }
+  // sends either straight to the provider, or via your own proxy server (keys stay private there)
+  function send_(p, url, headers, body) {
+    if (CFG.proxyUrl && p.viaProxy) return fetchJSON(CFG.proxyUrl, { "Content-Type": "application/json" }, { provider: p.id, model: p.model, payload: body });
+    return fetchJSON(url, headers, body);
+  }
+
+  async function askGemini(p, history, imagePart) {
+    const recent = history.slice(-CONTEXT_TURNS);
+    const contents = recent.map((m, i) => {
+      const parts = [{ text: m.text }];
+      if (i === recent.length - 1 && imagePart) parts.push({ inline_data: { mime_type: imagePart.mime, data: imagePart.data } });
+      return { role: m.role === "user" ? "user" : "model", parts };
+    });
+    const body = { system_instruction: { parts: [{ text: systemPrompt() }] }, contents, generationConfig: { temperature: 0.5, maxOutputTokens: 700 } };
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(p.model) + ":generateContent";
+    const headers = { "Content-Type": "application/json", "x-goog-api-key": p.apiKey || "" };
+    let data;
+    if (p.search) {
+      try { data = await send_(p, url, headers, Object.assign({}, body, { tools: [{ google_search: {} }] })); }
+      catch (e) { if (e.status === 400) data = await send_(p, url, headers, body); else throw e; }
+    } else data = await send_(p, url, headers, body);
+    const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
+    return parts ? parts.map(x => x.text || "").join("").trim() : "";
+  }
+
+  async function askOpenAICompatible(p, history, imagePart) {
+    const recent = history.slice(-CONTEXT_TURNS);
+    const msgs = [{ role: "system", content: systemPrompt() }].concat(recent.map((m, i) => {
+      const role = m.role === "user" ? "user" : "assistant";
+      if (i === recent.length - 1 && imagePart && p.vision) {
+        return { role, content: [{ type: "text", text: m.text }, { type: "image_url", image_url: { url: "data:" + imagePart.mime + ";base64," + imagePart.data } }] };
+      }
+      return { role, content: m.text };
+    }));
+    const headers = { "Content-Type": "application/json", "Authorization": "Bearer " + (p.apiKey || "") };
+    if (p.id === "openrouter") { headers["HTTP-Referer"] = location.origin; headers["X-Title"] = "CAMPUS MARKET"; }
+    const data = await send_(p, p.url, headers, { model: p.model, messages: msgs, temperature: 0.5, max_tokens: 700 });
+    const c = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    return (typeof c === "string" ? c : "").trim();
+  }
+
+  // Tries providers in turn. preferred = a provider id chosen by the shopper, or "auto".
+  async function askAI(history, imagePart, preferred) {
+    let list = activeProviders();
+    if (preferred && preferred !== "auto") {
+      const first = list.filter(p => p.id === preferred);
+      list = first.concat(list.filter(p => p.id !== preferred));     // chosen one first, others as backup
+    } else if (CFG.mode === "spread" && list.length > 1) {
+      const k = rr++ % list.length; list = list.slice(k).concat(list.slice(0, k));
+    }
+    if (imagePart) {                                                  // picture questions need a provider that can see
+      const seers = list.filter(p => p.vision); if (seers.length) list = seers;
+    }
+    const failures = [];
+    for (const p of list) {
+      try {
+        const text = p.type === "gemini" ? await askGemini(p, history, imagePart) : await askOpenAICompatible(p, history, imagePart);
+        if (text) return { text, by: p.name, id: p.id };
+        failures.push(p.name + ": empty answer");
+      } catch (e) { failures.push(p.name + ": " + e.message); }
+    }
+    const err = new Error("All providers failed"); err.failures = failures; throw err;
+  }
+
+  /* ---------- built-in answers (used when no AI service is configured or reachable) ---------- */
+  function builtInAnswer(q) {
+    const t = q.toLowerCase();
+    let places = "our pickup and delivery points";
+    try { places = FMG.locations.map(l => l.label).join(", "); } catch (e) {}
+    if (/^\s*(hi|hello|hey|good (morning|afternoon|evening))\b/.test(t)) return "Hello! I'm the Business AI. I can help with products, payments, delivery, discounts and starting a business on CAMPUS MARKET. What would you like to know?";
+    if (/deliver|pickup|pick up|shipping/.test(t)) return "We deliver to or offer pickup at: " + places + ". Choose your point at checkout. Some products add a small delivery fee (never more than UGX 10,000), shown before you pay.";
+    if (/pay|momo|airtel|card|mastercard|money/.test(t)) return "You can pay with MTN MoMo, Airtel Pay or Mastercard. Checkout only shows the methods that every seller in your cart accepts.";
+    if (/discount|offer|cheap|price/.test(t)) return "Look for the yellow discount badge on a product card; it shows the current price cut from that business. You can also use the search and category filters at the top to compare prices.";
+    if (/cart|order|checkout/.test(t)) return "Add items to your cart, then open the cart and choose your delivery or pickup point and payment method. The seller is notified so they can prepare your order.";
+    if (/business|sell|register|sign ?up|grow|marketing/.test(t)) return "Registering a business is free for the first 100 sign-ups, for 6 months. Tips to grow: use clear photos, price honestly, reply quickly through Messages, and keep stock updated.";
+    if (/human|agent|talk to|seller|message/.test(t)) return "Use \"Message seller\" on a product page, and check the Messages button at the top of the site for their reply.";
+    if (/best|recommend|quality|value/.test(t)) return "For the best value, compare similar products by price, seller and photos, and message the seller with any questions before buying. Smarter recommendations will be available once the AI services are connected.";
+    return "I can help with products, payments, delivery points, discounts and starting a business. What would you like to know?";
+  }
+
+  /* ---------- send flow ---------- */
+  async function send(textOverride) {
+    if (busy) return;
+    const input = $("baiInput");
+    const text = (textOverride || input.value).trim();
+    if (!text && !pendingImage) return;
+    const question = text || "What can you tell me about this picture?";
+    input.value = "";
+    const img = pendingImage; pendingImage = null; renderAttachChip();
+    const history = loadHistory();
+    history.push({ role: "user", text: question, at: Date.now(), hadImage: !!img });
+    saveHistory(history);
+    addBubble("user", question, img ? { imageSrc: "data:" + img.mime + ";base64," + img.data } : undefined);
+    $("baiClearBtn").style.display = "";
+    busy = true; $("baiSend").disabled = true;
+    const typing = addBubble("bot", "Researching…"); typing.classList.add("typing");
+    let answer, fellBack = false, by = "";
+    try {
+      if (!aiReady()) throw new Error("not-configured");
+      const res = await askAI(history, img, $("baiProvider") ? $("baiProvider").value : "auto"); answer = res.text; by = res.by;
+    } catch (err) {
+      if (err.message !== "not-configured") console.warn("Business AI fell back to built-in answers:", err.failures || err);
+      fellBack = true;
+      answer = builtInAnswer(question);
+      if (img) answer = "I can't analyse pictures right now, but " + answer.charAt(0).toLowerCase() + answer.slice(1);
+    }
+    typing.remove();
+    const bub = addBubble("bot", answer);
+    if (by) { const tag = document.createElement("div"); tag.className = "bai-by"; tag.textContent = "via " + by; bub.appendChild(tag); }
+    history.push({ role: "bot", text: answer, by: by, at: Date.now(), offline: fellBack });
+    saveHistory(history);
+    busy = false; $("baiSend").disabled = false; input.focus();
+  }
+
+  /* ---------- image attach (shopper photo or product photo) ---------- */
+  function renderAttachChip() {
+    const c = $("baiAttach");
+    if (!pendingImage) { c.classList.add("hidden"); c.innerHTML = ""; return; }
+    c.classList.remove("hidden");
+    c.innerHTML = '<img src="data:' + pendingImage.mime + ';base64,' + pendingImage.data + '" alt=""><span>' + esc(pendingImage.label) + '</span><button type="button" aria-label="Remove image">&times;</button>';
+    c.querySelector("button").onclick = () => { pendingImage = null; renderAttachChip(); };
+  }
+  function fileToImage(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onerror = reject;
+      fr.onload = () => {
+        const im = new Image();
+        im.onerror = reject;
+        im.onload = () => {
+          const s = Math.min(1, 900 / Math.max(im.width, im.height));
+          const c = document.createElement("canvas"); c.width = Math.round(im.width * s); c.height = Math.round(im.height * s);
+          c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+          resolve({ mime: "image/jpeg", data: c.toDataURL("image/jpeg", 0.8).split(",")[1], label: file.name || "photo" });
+        };
+        im.src = fr.result;
+      };
+      fr.readAsDataURL(file);
+    });
+  }
+
+  /* ---------- public: ask about a product (button on product page) ---------- */
+  window.askBusinessAIAboutProduct = function (productId) {
+    const p = FMG.getProducts().find(x => x.id === productId);
+    if (!p) return;
+    const ov = document.getElementById("productOverlay"); if (ov) ov.remove();
+    openPanel();
+    const b = FMG.businessById(p.bizId);
+    if (typeof p.image === "string" && p.image.indexOf("data:image") === 0) {
+      pendingImage = { mime: p.image.slice(5, p.image.indexOf(";")), data: p.image.split(",")[1], label: p.name };
+      renderAttachChip();
+    }
+    send("Tell me about \"" + p.name + "\" from " + (b ? b.name : "this seller") + ": what does the picture show, is the price fair, and what should I check before buying?");
+  };
+
+  function fillProviders() {
+    const sel = $("baiProvider"); if (!sel) return;
+    const keep = sel.value || "auto";
+    sel.innerHTML = '<option value="auto">Auto (best available)</option>' + activeProviders().map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join("");
+    sel.value = [...sel.options].some(o => o.value === keep) ? keep : "auto";
+    sel.parentElement.style.display = activeProviders().length > 1 ? "" : "none";
+  }
+  function openPanel() { fillProviders(); $("baiPanel").classList.remove("hidden"); $("baiToggle").classList.add("hidden"); renderHistory(); }
+  function closePanel() { $("baiPanel").classList.add("hidden"); $("baiToggle").classList.remove("hidden"); }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    if (!$("baiPanel")) return;
+    $("baiToggle").onclick = openPanel;
+    $("baiCloseBtn").onclick = closePanel;
+    $("baiSend").onclick = () => send();
+    $("baiInput").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+    $("baiPhotoBtn").onclick = () => $("baiFile").click();
+    $("baiFile").onchange = async e => {
+      const f = e.target.files[0]; e.target.value = "";
+      if (!f || !/^image\//.test(f.type)) return;
+      try { pendingImage = await fileToImage(f); renderAttachChip(); } catch (_) { FMG && typeof showToast === "function" && showToast("Couldn't read that image."); }
+    };
+    $("baiClearBtn").onclick = () => { if (confirm("Delete your chat history with Business AI on this device?")) { localStorage.removeItem(memoryKey()); renderHistory(); } };
+    document.querySelectorAll(".bai-quick button").forEach(b => b.onclick = () => send(b.textContent));
+    // switching account (login/logout) loads that person's own conversation
+    window.addEventListener("storage", e => { if (e.key === "fmg_session" && !$("baiPanel").classList.contains("hidden")) renderHistory(); });
   });
-}
-
-function fmgSaveSynced(collectionName, localKey, list) {
-  const previous = fmgLoad(localKey, []);
-  fmgSave(localKey, list);
-  fmgSyncListToCloud(collectionName, previous, list);
-}
-
-function fmgSyncMetaToCloud(docId, value) {
-  if (!fmgCloudReady) return;
-  fmgDB.collection("fmg_meta").doc(docId).set({ value })
-    .catch(err => console.error("Cloud sync (write) failed for", docId, err));
-}
-
-// If this device already has local data (e.g. a business that signed up before cloud sync was
-// turned on) and the cloud collection is still empty, push the local copy up FIRST. Without this,
-// the watcher below would see an empty cloud collection and overwrite — permanently wipe — local
-// data that was never actually lost, just never synced yet. localList is captured synchronously,
-// before any network round-trip, so there is no race with the watcher that gets attached after.
-// Which collections/docs have been confirmed in step with the cloud (so an empty cloud reading can be trusted).
-const fmgSeedOK = {};
-const fmgSleep = ms => new Promise(r => setTimeout(r, ms));
-
-// Runs fn(), retrying a few times if Firebase says it is offline (common right at page load,
-// or on networks/browsers that block Firestore's normal connection).
-async function fmgRetry(fn, label) {
-  const waits = [0, 1500, 3500, 7000];
-  let lastErr;
-  for (const w of waits) {
-    if (w) await fmgSleep(w);
-    try { return await fn(); } catch (e) { lastErr = e; }
-  }
-  console.warn("Cloud sync could not confirm", label, "- keeping this device's data safe and continuing:", lastErr && lastErr.message);
-  throw lastErr;
-}
-
-// If this device already has local data (e.g. a business that signed up before cloud sync was
-// turned on) and the cloud collection is empty, push the local copy up FIRST. Without this the
-// watcher would see an empty cloud and overwrite local data that was only ever never synced.
-function fmgSeedCollectionIfEmpty(collectionName, localKey) {
-  const localList = fmgLoad(localKey, []);   // captured synchronously, before any network call
-  if (!Array.isArray(localList) || localList.length === 0) { fmgSeedOK[localKey] = true; return Promise.resolve(); }
-  return fmgRetry(async () => {
-    const snap = await fmgDB.collection(collectionName).limit(1).get();
-    if (!snap.empty) return;   // cloud already has real data: never overwrite it with a stale local copy
-    const batch = fmgDB.batch();
-    localList.forEach(item => { if (item && item.id) batch.set(fmgDB.collection(collectionName).doc(String(item.id)), item); });
-    await batch.commit();
-  }, collectionName).then(() => { fmgSeedOK[localKey] = true; }).catch(() => {});
-}
-
-function fmgSeedMetaIfEmpty(docId, localKey, fallback) {
-  const localValue = fmgLoad(localKey, fallback);
-  const isDefault = JSON.stringify(localValue) === JSON.stringify(fallback);
-  if (isDefault) { fmgSeedOK[localKey] = true; return Promise.resolve(); }   // nothing worth uploading
-  return fmgRetry(async () => {
-    const doc = await fmgDB.collection("fmg_meta").doc(docId).get();
-    if (doc.exists) return;
-    await fmgDB.collection("fmg_meta").doc(docId).set({ value: localValue });
-  }, docId).then(() => { fmgSeedOK[localKey] = true; }).catch(() => {});
-}
-
-function fmgInitCloud() {
-  if (typeof FMG_CLOUD_ENABLED === "undefined" || !FMG_CLOUD_ENABLED) return;
-  if (typeof firebase === "undefined") {
-    console.warn("FMG_CLOUD_ENABLED is true but the Firebase scripts didn't load — " +
-      "check your internet connection and script tags. Running in local-only mode for now.");
-    return;
-  }
-  try {
-    firebase.initializeApp(FMG_FIREBASE_CONFIG);
-    fmgDB = firebase.firestore();
-    try { fmgDB.settings({ experimentalAutoDetectLongPolling: true, merge: true }); } catch (e) { /* older SDK: ignore */ }
-    fmgCloudReady = true;
-
-    const seeding = Promise.all([
-      fmgSeedCollectionIfEmpty("fmg_products", "fmg_products"),
-      fmgSeedCollectionIfEmpty("fmg_businesses", "fmg_businesses"),
-      fmgSeedCollectionIfEmpty("fmg_users", "fmg_users"),
-      fmgSeedCollectionIfEmpty("fmg_orders", "fmg_orders"),
-      fmgSeedCollectionIfEmpty("fmg_feedback", "fmg_feedback"),
-      fmgSeedCollectionIfEmpty("fmg_threads", "fmg_threads"),
-      fmgSeedMetaIfEmpty("payment_accounts", "fmg_payment_accounts", {}),
-      fmgSeedMetaIfEmpty("registered_business_count", "fmg_registered_business_count", 0)
-    ]);
-
-    // Only start watching (and therefore only start possibly overwriting localStorage) once we
-    // know anything this device already had has either matched the cloud or been pushed up to it.
-    seeding.finally(() => {
-      fmgWatchList("fmg_products", "fmg_products");
-      fmgWatchList("fmg_businesses", "fmg_businesses");
-      fmgWatchList("fmg_users", "fmg_users");
-      fmgWatchList("fmg_orders", "fmg_orders");
-      fmgWatchList("fmg_feedback", "fmg_feedback");
-      fmgWatchList("fmg_threads", "fmg_threads");
-      fmgWatchMeta("payment_accounts", "fmg_payment_accounts", {});
-      fmgWatchMeta("registered_business_count", "fmg_registered_business_count", 0);
-    });
-  } catch (e) {
-    console.error("Could not start cloud sync — check FMG_FIREBASE_CONFIG. Falling back to local-only mode:", e);
-    fmgCloudReady = false;
-  }
-}
-
-/* ---------- placeholder art (no external image hosting needed) ----------
-   Businesses upload real photos (stored as compressed data URLs — see
-   js/main.js compressImage()). Until a photo is uploaded, or for the demo
-   catalogue, we render a light, on-brand SVG tile so the grid never shows
-   broken images and never depends on outside servers. */
-function fmgPlaceholder(category, seedText) {
-  const palettes = {
-    electronics: ["#1B2A4A", "#E8A93B"],
-    fashion: ["#3B2417", "#E8A93B"],
-    office: ["#14110F", "#C7CBD1"],
-    machinery: ["#2B2016", "#E8A93B"],
-    home: ["#3B2417", "#FBF9F6"],
-    agriculture: ["#1B2A4A", "#8FAE6B"]
-  };
-  const [bg, fg] = palettes[category] || ["#14110F", "#E8A93B"];
-  const initials = (seedText || category).trim().slice(0, 2).toUpperCase();
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300">
-    <rect width="400" height="300" fill="${bg}"/>
-    <circle cx="330" cy="40" r="90" fill="${fg}" opacity="0.12"/>
-    <circle cx="40" cy="270" r="110" fill="${fg}" opacity="0.1"/>
-    <text x="200" y="168" font-family="Georgia, serif" font-size="72" fill="${fg}" text-anchor="middle" opacity="0.9">${initials}</text>
-  </svg>`;
-  return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
-}
-
-/* ---------- seed content (first run only) ---------- */
-
-function fmgSeed() {
-  if (typeof FMG_CLOUD_ENABLED !== "undefined" && FMG_CLOUD_ENABLED) return; // cloud mode starts empty — real sign-ups only
-  if (fmgLoad("fmg_seeded", false)) return;
-
-  const businesses = [
-    { id: "biz_kasese_electro", name: "Kasese Electro Hub", email: "kasese.electro@example.com", password: "demo1234",
-      category: "electronics", location: "kampala", bio: "Phones, accessories and home electronics at fair prices.",
-      joined: "2026-02-11", freeTrial: true, trialEndsAt: "2026-08-11",
-      paymentMethods: { momo: { enabled: true, number: "+256 701 222 333" }, airtel: { enabled: false, number: "" },
-                         mastercard: { enabled: true, merchantId: "KEH-MC-001" } } },
-    { id: "biz_masaka_threads", name: "Masaka Threads", email: "masaka.threads@example.com", password: "demo1234",
-      category: "fashion", location: "masaka", bio: "Locally tailored fashion for men, women and children.",
-      joined: "2026-03-02", freeTrial: true, trialEndsAt: "2026-09-02",
-      paymentMethods: { momo: { enabled: true, number: "+256 772 444 555" }, airtel: { enabled: true, number: "+256 752 444 555" },
-                         mastercard: { enabled: false, merchantId: "" } } },
-    { id: "biz_gayaza_office", name: "Gayaza Office Supplies", email: "gayaza.office@example.com", password: "demo1234",
-      category: "office", location: "gayaza", bio: "Stationery, furniture and printing supplies for every office.",
-      joined: "2026-04-18", freeTrial: true, trialEndsAt: "2026-10-18",
-      paymentMethods: { momo: { enabled: true, number: "+256 703 666 777" }, airtel: { enabled: false, number: "" },
-                         mastercard: { enabled: true, merchantId: "GOS-MC-014" } } },
-    { id: "biz_kyotera_agro", name: "Kyotera Agro Machines", email: "kyotera.agro@example.com", password: "demo1234",
-      category: "machinery", location: "kyotera", bio: "Farm machinery, irrigation tools and spare parts.",
-      joined: "2026-01-27", freeTrial: true, trialEndsAt: "2026-07-27",
-      paymentMethods: { momo: { enabled: true, number: "+256 782 888 999" }, airtel: { enabled: true, number: "+256 754 888 999" },
-                         mastercard: { enabled: false, merchantId: "" } } }
-  ];
-
-  // Demo delivery/pickup coverage per seeded business (matches the "Delivery & pickup" section) —
-  // gives the checkout flow real fee data to compute against in a fresh demo.
-  const bizLocations = {
-    biz_kasese_electro: ["kampala", "gayaza"],
-    biz_masaka_threads: ["masaka", "kumasaka", "ssembabule"],
-    biz_gayaza_office: ["gayaza", "kampala"],
-    biz_kyotera_agro: ["kyotera", "masaka"]
-  };
-  Object.entries(bizLocations).forEach(([bizId, locs]) => fmgSave("fmg_biz_locations_" + bizId, locs));
-
-  const products = [
-    { name: "Dual-SIM Smartphone", category: "electronics", bizId: "biz_kasese_electro", price: 620000, discount: 10, stock: 24,
-      desc: "6.5\" display, 128GB storage, dual camera. Great value entry smartphone.",
-      deliveryEnabled: true, deliveryFees: { kampala: 5000, gayaza: 7000 } },
-    { name: "Bluetooth Speaker", category: "electronics", bizId: "biz_kasese_electro", price: 95000, discount: 0, stock: 40,
-      desc: "Portable speaker with 12-hour battery life and deep bass.",
-      deliveryEnabled: true, deliveryFees: { kampala: 3000, gayaza: 4000 } },
-    { name: "Solar Charging Kit", category: "electronics", bizId: "biz_kasese_electro", price: 180000, discount: 15, stock: 12,
-      desc: "Solar panel with two USB ports, ideal for areas with unreliable power.",
-      deliveryEnabled: false, deliveryFees: {} },
-    { name: "Men's Tailored Suit", category: "fashion", bizId: "biz_masaka_threads", price: 260000, discount: 0, stock: 8,
-      desc: "Made-to-measure two-piece suit, locally tailored in Masaka.",
-      deliveryEnabled: true, deliveryFees: { masaka: 2000, kumasaka: 2000, ssembabule: 6000 } },
-    { name: "Ankara Print Dress", category: "fashion", bizId: "biz_masaka_threads", price: 85000, discount: 20, stock: 15,
-      desc: "Vibrant Ankara print, available in multiple sizes.",
-      deliveryEnabled: true, deliveryFees: { masaka: 2000, kumasaka: 2000, ssembabule: 6000 } },
-    { name: "Kids School Uniform Set", category: "fashion", bizId: "biz_masaka_threads", price: 45000, discount: 0, stock: 30,
-      desc: "Durable school uniform set, sizes for ages 5 to 14.",
-      deliveryEnabled: false, deliveryFees: {} },
-    { name: "Office Desk (1.2m)", category: "office", bizId: "biz_gayaza_office", price: 310000, discount: 5, stock: 10,
-      desc: "Sturdy wood-finish office desk with drawer storage.",
-      deliveryEnabled: true, deliveryFees: { gayaza: 8000, kampala: 10000 } },
-    { name: "Ream of A4 Paper (5-pack)", category: "office", bizId: "biz_gayaza_office", price: 60000, discount: 0, stock: 100,
-      desc: "High quality 80gsm printing paper, five reams.",
-      deliveryEnabled: true, deliveryFees: { gayaza: 2000, kampala: 4000 } },
-    { name: "Ergonomic Office Chair", category: "office", bizId: "biz_gayaza_office", price: 220000, discount: 12, stock: 18,
-      desc: "Adjustable height, lumbar support, mesh back.",
-      deliveryEnabled: false, deliveryFees: {} },
-    { name: "Water Pump (2 inch)", category: "machinery", bizId: "biz_kyotera_agro", price: 540000, discount: 0, stock: 6,
-      desc: "Petrol-powered water pump for irrigation, 2-inch outlet.",
-      deliveryEnabled: false, deliveryFees: {} },
-    { name: "Maize Milling Machine", category: "machinery", bizId: "biz_kyotera_agro", price: 2400000, discount: 8, stock: 3,
-      desc: "Diesel-powered milling machine, 200kg/hour capacity.",
-      deliveryEnabled: false, deliveryFees: {} },
-    { name: "Hand Hoe Set (10-pack)", category: "machinery", bizId: "biz_kyotera_agro", price: 150000, discount: 0, stock: 25,
-      desc: "Ten durable hand hoes for farm and garden work.",
-      deliveryEnabled: true, deliveryFees: { kyotera: 3000, masaka: 6000 } }
-  ];
-
-  const seededBiz = businesses.map(b => ({ ...b, role: "business" }));
-  const seededProducts = products.map(p => ({
-    id: fmgId("prod"),
-    name: p.name,
-    category: p.category,
-    bizId: p.bizId,
-    price: p.price,
-    discount: p.discount,
-    stock: p.stock,
-    desc: p.desc,
-    deliveryEnabled: !!p.deliveryEnabled,
-    deliveryFees: p.deliveryFees || {},
-    image: fmgPlaceholder(p.category, p.name),
-    createdAt: new Date().toISOString(),
-    views: Math.floor(Math.random() * 300) + 20
-  }));
-
-  fmgSave("fmg_businesses", seededBiz);
-  fmgSave("fmg_products", seededProducts);
-  fmgSave("fmg_users", []);
-  fmgSave("fmg_orders", []);
-  fmgSave("fmg_cart", []);
-  fmgSave("fmg_threads", []);
-  fmgSave("fmg_feedback", [
-    { id: fmgId("fb"), from: "user", name: "Grace N.", message: "I love how easy it is to find fashion items from Masaka sellers!", createdAt: "2026-05-02" }
-  ]);
-  fmgSave("fmg_traffic", fmgGenerateTraffic());
-  fmgSave("fmg_payment_accounts", { momo: "+256 700 000 000 (GROUP A KU MASAKA)", airtel: "+256 750 000 000 (GROUP A KU MASAKA)", mastercard: "Merchant ID: KUM-2026-FMG-001" });
-  fmgSave("fmg_registered_business_count", businesses.length);
-  fmgSave("fmg_seeded", true);
-}
-
-function fmgGenerateTraffic() {
-  const days = [];
-  const now = new Date();
-  for (let i = 29; i >= 0; i--) {
-    const d = new Date(now);
-    d.setDate(d.getDate() - i);
-    days.push({ date: d.toISOString().slice(0, 10), visits: Math.floor(Math.random() * 400) + 150 });
-  }
-  return days;
-}
-
-/* ---------- accessors used by the rest of the app ---------- */
-
-const FMG = {
-  categories: FMG_CATEGORIES,
-  locations: FMG_LOCATIONS,
-
-  getProducts() { return fmgLoad("fmg_products", []); },
-  saveProducts(list) { fmgSaveSynced("fmg_products", "fmg_products", list); },
-
-  getBusinesses() { return fmgLoad("fmg_businesses", []); },
-  saveBusinesses(list) { fmgSaveSynced("fmg_businesses", "fmg_businesses", list); },
-
-  getUsers() { return fmgLoad("fmg_users", []); },
-  saveUsers(list) { fmgSaveSynced("fmg_users", "fmg_users", list); },
-
-  getOrders() { return fmgLoad("fmg_orders", []); },
-  saveOrders(list) { fmgSaveSynced("fmg_orders", "fmg_orders", list); },
-
-  getCart() { return fmgLoad("fmg_cart", []); },
-  saveCart(list) { fmgSave("fmg_cart", list); },
-
-  getFeedback() { return fmgLoad("fmg_feedback", []); },
-  saveFeedback(list) { fmgSaveSynced("fmg_feedback", "fmg_feedback", list); },
-
-  getThreads() { return fmgLoad("fmg_threads", []); },
-  saveThreads(list) { fmgSaveSynced("fmg_threads", "fmg_threads", list); },
-
-  getTraffic() { return fmgLoad("fmg_traffic", []); },
-
-  getPaymentAccounts() { return fmgLoad("fmg_payment_accounts", {}); },
-  savePaymentAccounts(v) { fmgSave("fmg_payment_accounts", v); fmgSyncMetaToCloud("payment_accounts", v); },
-
-  getSession() { return fmgLoad("fmg_session", null); },
-  setSession(v) { fmgSave("fmg_session", v); },
-  clearSession() { localStorage.removeItem("fmg_session"); },
-
-  getConsent() { return fmgLoad("fmg_consent", null); },
-  setConsent(v) { fmgSave("fmg_consent", v); },
-
-  businessById(id) { return this.getBusinesses().find(b => b.id === id); },
-  locationById(id) { return FMG_LOCATIONS.find(l => l.id === id); },
-  categoryById(id) { return FMG_CATEGORIES.find(c => c.id === id); },
-
-  paymentMethods: FMG_PAYMENT_METHODS,
-  emptyPaymentMethods: fmgEmptyPaymentMethods,
-  maxDeliveryFee: FMG_MAX_DELIVERY_FEE,
-
-  // Payment methods a single business actually has switched on AND filled in an account for.
-  businessOfferedMethods(biz) {
-    const pm = (biz && biz.paymentMethods) || fmgEmptyPaymentMethods();
-    return FMG_PAYMENT_METHODS.filter(m => {
-      const entry = pm[m.id] || {};
-      return entry.enabled && String(entry[m.field] || "").trim().length > 0;
-    }).map(m => m.id);
-  },
-
-  // The payment methods every business represented in this cart can accept in common —
-  // a shopper can only check out together if there is at least one shared method.
-  commonOfferedMethods(cart) {
-    const products = this.getProducts();
-    const businesses = this.getBusinesses();
-    const bizIds = new Set();
-    cart.forEach(c => {
-      const p = products.find(x => x.id === c.productId);
-      if (p) bizIds.add(p.bizId);
-    });
-    if (bizIds.size === 0) return [];
-    let common = null;
-    bizIds.forEach(id => {
-      const biz = businesses.find(b => b.id === id);
-      const offered = new Set(this.businessOfferedMethods(biz));
-      common = common === null ? offered : new Set([...common].filter(m => offered.has(m)));
-    });
-    return FMG_PAYMENT_METHODS.filter(m => common && common.has(m.id)).map(m => m.id);
-  },
-
-  // Delivery fee for one product to one location, clamped to the platform cap either way.
-  productDeliveryFee(product, locationId) {
-    if (!product || !product.deliveryEnabled || !locationId) return 0;
-    const fee = (product.deliveryFees || {})[locationId];
-    if (!fee || fee <= 0) return 0;
-    return Math.min(fee, FMG_MAX_DELIVERY_FEE);
-  },
-
-  // Total delivery fee for a cart at one chosen location: once per distinct product, not per unit.
-  cartDeliveryFee(cart, locationId) {
-    const products = this.getProducts();
-    let total = 0;
-    cart.forEach(c => {
-      const p = products.find(x => x.id === c.productId);
-      total += this.productDeliveryFee(p, locationId);
-    });
-    return total;
-  },
-
-  placeholder: fmgPlaceholder,
-  uid: fmgId,
-
-  isCloudEnabled() { return fmgCloudReady; },
-
-  isFreeTrialAvailable() {
-    return fmgLoad("fmg_registered_business_count", 0) < FMG_FREE_TRIAL_LIMIT;
-  },
-  registerBusinessTrialSlot() {
-    const n = fmgLoad("fmg_registered_business_count", 0);
-    const next = n + 1;
-    fmgSave("fmg_registered_business_count", next);
-    fmgSyncMetaToCloud("registered_business_count", next);
-    return n < FMG_FREE_TRIAL_LIMIT;
-  }
-};
-
-fmgSeed();
-fmgInitCloud();
+  window.businessAIRefresh = function () { if ($("baiPanel") && !$("baiPanel").classList.contains("hidden")) renderHistory(); };
+})();
