@@ -8,22 +8,10 @@ function money(n) {
 
 /* ---------------- cookie / data-use consent ---------------- */
 function initConsent() {
-  const banner = document.getElementById("cookieBanner");
-  const consent = FMG.getConsent();
-  if (consent) { banner.classList.add("hidden"); return; }
-  banner.classList.remove("hidden");
-  document.getElementById("consentAccept").onclick = () => {
-    FMG.setConsent({ accepted: true, at: new Date().toISOString() });
-    banner.classList.add("hidden");
-  };
-  document.getElementById("consentDecline").onclick = () => {
-    FMG.setConsent({ accepted: false, at: new Date().toISOString() });
-    banner.classList.add("hidden");
-  };
-  document.getElementById("consentLink").onclick = (e) => {
-    e.preventDefault();
-    openTermsModal();
-  };
+    const banner = document.getElementById("dataConsentBanner");
+    if (banner) {
+        banner.classList.remove("hidden");
+    }
 }
 
 function openTermsModal() {
