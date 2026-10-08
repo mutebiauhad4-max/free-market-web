@@ -156,6 +156,22 @@
     const err = new Error("All providers failed"); err.failures = failures; throw err;
   }
 
+  /* ---------- built-in answers (used when no AI service is configured or reachable) ---------- */
+  function builtInAnswer(q) {
+    const t = q.toLowerCase();
+    let places = "our pickup and delivery points";
+    try { places = FMG.locations.map(l => l.label).join(", "); } catch (e) {}
+    if (/^\s*(hi|hello|hey|good (morning|afternoon|evening))\b/.test(t)) return "Hello! I'm the Business AI. I can help with products, payments, delivery, discounts and starting a business on CAMPUS MARKET. What would you like to know?";
+    if (/deliver|pickup|pick up|shipping/.test(t)) return "We deliver to or offer pickup at: " + places + ". Choose your point at checkout. Some products add a small delivery fee (never more than UGX 10,000), shown before you pay.";
+    if (/pay|momo|airtel|card|mastercard|money/.test(t)) return "You can pay with MTN MoMo, Airtel Pay or Mastercard. Checkout only shows the methods that every seller in your cart accepts.";
+    if (/discount|offer|cheap|price/.test(t)) return "Look for the yellow discount badge on a product card; it shows the current price cut from that business. You can also use the search and category filters at the top to compare prices.";
+    if (/cart|order|checkout/.test(t)) return "Add items to your cart, then open the cart and choose your delivery or pickup point and payment method. The seller is notified so they can prepare your order.";
+    if (/business|sell|register|sign ?up|grow|marketing/.test(t)) return "Registering a business is free for the first 100 sign-ups, for 6 months. Tips to grow: use clear photos, price honestly, reply quickly through Messages, and keep stock updated.";
+    if (/human|agent|talk to|seller|message/.test(t)) return "Use \"Message seller\" on a product page, and check the Messages button at the top of the site for their reply.";
+    if (/best|recommend|quality|value/.test(t)) return "For the best value, compare similar products by price, seller and photos, and message the seller with any questions before buying. Smarter recommendations will be available once the AI services are connected.";
+    return "I can help with products, payments, delivery points, discounts and starting a business. What would you like to know?";
+  }
+
   /* ---------- send flow ---------- */
   async function send(textOverride) {
     if (busy) return;
@@ -179,7 +195,7 @@
     } catch (err) {
       if (err.message !== "not-configured") console.warn("Business AI fell back to built-in answers:", err.failures || err);
       fellBack = true;
-      answer = (typeof botReply === "function") ? botReply(question) : "Sorry, I can't reach the research service right now. Please try again shortly.";
+      answer = builtInAnswer(question);
       if (img) answer = "I can't analyse pictures right now, but " + answer.charAt(0).toLowerCase() + answer.slice(1);
     }
     typing.remove();
