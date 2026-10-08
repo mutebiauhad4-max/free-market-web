@@ -173,6 +173,16 @@
   </div>
 </div>
 
+<button class="bai-toggle" id="baiToggle" aria-label="Open Business AI">AI</button>
+<div class="bai-panel hidden" id="baiPanel">
+  <div class="bai-head"><strong>Business AI</strong><button id="baiCloseBtn" aria-label="Close">&times;</button></div>
+  <div class="bai-body" id="baiBody"></div>
+  <div class="bai-quick"><button>Find products</button><button>How do I pay?</button><button>Register a business</button></div>
+  <div class="bai-attach hidden" id="baiAttach"></div>
+  <div class="bai-input"><button id="baiPhotoBtn" type="button" title="Attach photo">📷</button><input id="baiFile" type="file" accept="image/*" hidden><input id="baiInput" type="text" placeholder="Ask Business AI..."><button id="baiSend" type="button">Send</button></div>
+  <button class="bai-clear" id="baiClearBtn" type="button">Clear chat</button>
+</div>
+
 <!-- Optional shared-database sync: see js/firebase-config.js for the free 5-minute setup.
      Harmless to leave in even if you never turn it on. -->
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
@@ -181,5 +191,6 @@
 <script src="js/firebase-config.js"></script>
 <script src="js/data.js"></script>
 <script src="js/main.js"></script>
+<script src="js/business-ai.js"></script>
 </body>
 </html>
