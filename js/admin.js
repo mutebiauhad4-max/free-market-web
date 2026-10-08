@@ -13,6 +13,12 @@ function toast(msg) {
   el.textContent = msg; el.style.opacity = "1";
   clearTimeout(window._t); window._t = setTimeout(() => { el.style.opacity = "0"; }, 3200);
 }
+function initConsent() {
+    const banner = document.getElementById("dataConsentBanner");
+    if (banner) {
+        banner.classList.remove("hidden");
+    }
+}
 
 function checkAdminGate() {
   const session = FMG.getSession();
