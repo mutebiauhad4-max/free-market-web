@@ -1,33 +1,492 @@
-/* THE FREE MARKET GLOBE v2 - business dashboard */
-let CURRENT_BIZ=null, DASH=null, selectedLocations=[];
-function money(n){return 'UGX '+Number(n||0).toLocaleString('en-UG')}
-function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
-function trialStatus(b){if(!b.freeTrial)return{active:false,label:'Standard subscription',expired:false};const end=new Date(b.trialEndsAt),active=new Date()<=end;return{active,expired:!active,label:active?'Free trial · '+Math.max(0,Math.ceil((end-new Date())/86400000))+' days left':'Free trial ended'}}
-async function guardBusinessSession(){const s=FMG.getSession();if(!s||s.type!=='business'){location.href='index.html';return null}try{return(await fmgApi('/business/dashboard')).business}catch{FMG.clearSession();location.href='index.html';return null}}
-function showSection(id){document.querySelectorAll('.dash-section').forEach(s=>s.classList.add('hidden'));document.getElementById(id)?.classList.remove('hidden');document.querySelectorAll('.dash-nav a[data-section]').forEach(a=>a.classList.toggle('active',a.dataset.section===id));if(id==='sec-progression')renderChart('progressionCanvas','line');if(id==='sec-sales')renderChart('salesCanvas','bar');if(id==='sec-locations')setTimeout(initMap,50);if(id==='sec-messages')loadBusinessMessages()}
-function refreshDash(){return fmgApi('/business/dashboard').then(r=>{DASH=r;CURRENT_BIZ=r.business;renderOverview();renderProductsTable();renderOrdersTable();renderFinance();renderLocationSettings();renderPaymentSettings();renderChatbotSettings();return r})}
-function renderOverview(){document.getElementById('bizNameLabel').textContent=CURRENT_BIZ.name;const st=trialStatus(CURRENT_BIZ);document.getElementById('trialPill').textContent=st.label;document.getElementById('trialPill').classList.toggle('expired',st.expired);document.getElementById('kpiRevenue').textContent=money(DASH.revenue);document.getElementById('kpiProducts').textContent=DASH.products.length;document.getElementById('kpiUnits').textContent=DASH.units;document.getElementById('kpiLowStock').textContent=DASH.lowStock;document.getElementById('notificationList').innerHTML=DASH.notifications?.length?DASH.notifications.map(n=>`<li>${esc(n.text)} <span style="color:#6B625B;font-size:.76rem">· ${new Date(n.createdAt).toLocaleString()}</span></li>`).join(''):'<li>No recent notifications.</li>'}
-function renderProductsTable(){const body=document.getElementById('productsTableBody');body.innerHTML=DASH.products.length?DASH.products.map(p=>`<tr><td><img src="${p.image||FMG.placeholder(p.category,p.name)}" style="width:44px;height:44px;object-fit:cover;border-radius:3px"></td><td>${esc(p.name)}<br><span style="color:#6B625B;font-size:.78rem">${esc(FMG.categoryById(p.category)?.label||p.category)}</span></td><td>${money(p.price)}${p.discount?` <span style="color:var(--navy)">(-${p.discount}%)</span>`:''}</td><td>${p.stock}</td><td>${p.views||0}</td><td><button class="btn btn-outline-dark btn-sm" onclick="openProductForm('${p.id}')">Edit</button> <button class="btn btn-danger btn-sm" onclick="deleteBizProduct('${p.id}')">Delete</button></td></tr>`).join(''):'<tr><td colspan="6">No products yet.</td></tr>'}
-async function deleteBizProduct(id){if(!confirm('Remove this product from your storefront?'))return;try{await fmgApi('/products/'+id,{method:'DELETE'});await refreshDash();toast('Product removed.')}catch(e){toast(e.message)}}
-let editingProductId=null,pendingImage=null;
-function renderProductDeliverySettings(saved={}){const el=document.getElementById('productDeliverySettings');el.innerHTML=FMG.locations.map(l=>{const v=saved[l.id]||{};return `<div class="location-setting-row"><label><input type="checkbox" data-pdl="${l.id}" ${v.enabled?'checked':''}> ${l.label}</label><input type="number" min="0" max="10000" step="100" data-pdf="${l.id}" value="${Number(v.fee||0)}" placeholder="Fee UGX"></div>`}).join('')}
-function collectProductDeliverySettings(){const o={};FMG.locations.forEach(l=>{const enabled=document.querySelector(`[data-pdl="${l.id}"]`)?.checked;const fee=Math.min(10000,Math.max(0,Number(document.querySelector(`[data-pdf="${l.id}"]`)?.value||0)));if(enabled)o[l.id]={enabled:true,fee}});return o}
-function openProductForm(id){editingProductId=id||null;pendingImage=null;const p=id?DASH.products.find(x=>x.id===id):null;document.getElementById('productFormTitle').textContent=p?'Edit product':'Upload product';document.getElementById('pfName').value=p?.name||'';document.getElementById('pfCategory').value=p?.category||FMG.categories[0].id;document.getElementById('pfPrice').value=p?.price||'';document.getElementById('pfDiscount').value=p?.discount||0;document.getElementById('pfStock').value=p?.stock??'';document.getElementById('pfDesc').value=p?.desc||'';document.getElementById('uploadPreview').src=p?.image||FMG.placeholder(FMG.categories[0].id,'New');renderProductDeliverySettings(p?.deliveryOptions||{});document.getElementById('productFormError').classList.add('hidden');document.getElementById('productFormOverlay').classList.remove('hidden')}
-function closeProductForm(){document.getElementById('productFormOverlay').classList.add('hidden');pendingImage=null}
-function handleImageSelect(input){const file=input.files[0];if(!file)return;const reader=new FileReader();reader.onload=e=>{const img=new Image();img.onload=()=>{const max=1200;let w=img.width,h=img.height;if(Math.max(w,h)>max){const r=max/Math.max(w,h);w=Math.round(w*r);h=Math.round(h*r)}const c=document.createElement('canvas');c.width=w;c.height=h;c.getContext('2d').drawImage(img,0,0,w,h);c.toBlob(blob=>{pendingImage=blob;document.getElementById('uploadPreview').src=URL.createObjectURL(blob)},'image/webp',.78)};img.src=e.target.result};reader.readAsDataURL(file)}
-async function saveProductForm(){const err=document.getElementById('productFormError');const name=document.getElementById('pfName').value.trim(),price=Number(document.getElementById('pfPrice').value),stock=Number(document.getElementById('pfStock').value);if(!name||price<=0||stock<0||!Number.isFinite(stock)){err.textContent='Enter a product name, positive price and valid stock quantity.';err.classList.remove('hidden');return}err.classList.add('hidden');const fd=new FormData();fd.append('name',name);fd.append('category',document.getElementById('pfCategory').value);fd.append('price',price);fd.append('discount',Math.min(90,Math.max(0,Number(document.getElementById('pfDiscount').value)||0)));fd.append('stock',Math.floor(stock));fd.append('desc',document.getElementById('pfDesc').value.trim());fd.append('deliveryOptions',JSON.stringify(collectProductDeliverySettings()));if(pendingImage)fd.append('image',pendingImage,'product.webp');try{await fmgApi(editingProductId?'/products/'+editingProductId:'/products',{method:editingProductId?'PUT':'POST',body:fd});closeProductForm();await refreshDash();toast(editingProductId?'Product updated and live on the public site.':'Product uploaded to the server and is now live on the public site.')}catch(e){err.textContent=e.message;err.classList.remove('hidden')}}
-function renderOrdersTable(){const body=document.getElementById('ordersTableBody');const lines=DASH.lines||[];body.innerHTML=lines.length?lines.slice().reverse().map(l=>`<tr><td>${new Date(l.date).toLocaleDateString()}</td><td>${esc(DASH.products.find(p=>p.id===l.productId)?.name||l.productId)}</td><td>${l.qty}</td><td>${esc(FMG.locationById(l.location)?.label||l.location||'')}</td><td>${money(l.lineTotal)}</td></tr>`).join(''):'<tr><td colspan="5">No sales yet.</td></tr>'}
-function renderFinance(){const revenue=DASH.revenue||0,cogs=Math.round(revenue*.6),gross=revenue-cogs,st=trialStatus(CURRENT_BIZ),fee=st.active?0:Math.round(revenue*.05),net=gross-fee,inventory=DASH.products.reduce((s,p)=>s+p.price*p.stock,0),assets=inventory+revenue;document.getElementById('incomeStatement').innerHTML=`<table class="data-table"><tr><td>Sales revenue</td><td style="text-align:right">${money(revenue)}</td></tr><tr><td>Estimated cost of goods</td><td style="text-align:right">(${money(cogs)})</td></tr><tr><th>Gross profit</th><th style="text-align:right">${money(gross)}</th></tr><tr><td>Platform fee</td><td style="text-align:right">(${money(fee)})</td></tr><tr><th>Net profit</th><th style="text-align:right">${money(net)}</th></tr></table>`;document.getElementById('balanceSheet').innerHTML=`<table class="data-table"><tr><td>Cash from sales</td><td style="text-align:right">${money(revenue)}</td></tr><tr><td>Inventory</td><td style="text-align:right">${money(inventory)}</td></tr><tr><th>Total assets</th><th style="text-align:right">${money(assets)}</th></tr><tr><th>Owner equity</th><th style="text-align:right">${money(assets)}</th></tr></table>`}
-function renderLocationSettings(){const saved=CURRENT_BIZ.deliveryLocations||{};document.getElementById('locationSettingsList').innerHTML=FMG.locations.map(l=>{const v=saved[l.id]||{};return `<div class="location-setting-row"><label><input type="checkbox" data-bizloc="${l.id}" ${v.enabled?'checked':''}> ${l.label}</label><input type="number" min="0" max="10000" step="100" data-bizfee="${l.id}" value="${Number(v.fee||0)}" placeholder="Delivery fee UGX"></div>`}).join('');selectedLocations=FMG.locations.filter(l=>saved[l.id]?.enabled).map(l=>l.id);renderLocationChips()}
-function renderLocationChips(){document.getElementById('locationChips').innerHTML=selectedLocations.map(id=>`<span class="location-chip selected">${FMG.locationById(id)?.label}</span>`).join('')||'<span class="form-note">No delivery points enabled yet.</span>'}
-async function saveBusinessLocations(){const o={};FMG.locations.forEach(l=>{const enabled=document.querySelector(`[data-bizloc="${l.id}"]`)?.checked;const fee=Math.min(10000,Math.max(0,Number(document.querySelector(`[data-bizfee="${l.id}"]`)?.value||0)));if(enabled)o[l.id]={enabled:true,fee}});try{const r=await fmgApi('/business/settings',{method:'PUT',body:JSON.stringify({deliveryLocations:o})});CURRENT_BIZ=r.business;toast('Delivery points and fees saved. Maximum fee is UGX 10,000.');renderLocationSettings();initMap()}catch(e){toast(e.message)}}
-let bizMap=null;function initMap(){if(typeof L==='undefined')return;const el=document.getElementById('map');if(!el)return;if(bizMap)bizMap.remove();bizMap=L.map(el).setView([0,31.9],8);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap contributors',maxZoom:17}).addTo(bizMap);FMG.locations.forEach(l=>{const on=CURRENT_BIZ.deliveryLocations?.[l.id]?.enabled;L.circleMarker([l.lat,l.lng],{radius:on?9:5,color:on?'#E8A93B':'#1B2A4A',fillColor:on?'#E8A93B':'#1B2A4A',fillOpacity:.85}).addTo(bizMap).bindPopup(`${l.label}${on?' — enabled':''}`)})}
-function renderPaymentSettings(){const p=CURRENT_BIZ.paymentMethods||{};document.getElementById('payMomoEnabled').checked=!!p.momo?.enabled;document.getElementById('payMomoAccount').value=p.momo?.account||'';document.getElementById('payAirtelEnabled').checked=!!p.airtel?.enabled;document.getElementById('payAirtelAccount').value=p.airtel?.account||'';document.getElementById('payCardEnabled').checked=!!p.mastercard?.enabled;document.getElementById('payCardAccount').value=p.mastercard?.account||''}
-async function savePaymentMethods(){const paymentMethods={momo:{enabled:document.getElementById('payMomoEnabled').checked,account:document.getElementById('payMomoAccount').value.trim()},airtel:{enabled:document.getElementById('payAirtelEnabled').checked,account:document.getElementById('payAirtelAccount').value.trim()},mastercard:{enabled:document.getElementById('payCardEnabled').checked,account:document.getElementById('payCardAccount').value.trim()}};for(const [k,v] of Object.entries(paymentMethods))if(v.enabled&&!v.account)return toast(`Enter the ${k==='momo'?'MTN MoMo':k==='airtel'?'Airtel Pay':'Mastercard'} account details.`);try{const r=await fmgApi('/business/settings',{method:'PUT',body:JSON.stringify({paymentMethods})});CURRENT_BIZ=r.business;renderPaymentSettings();toast('Payment methods saved. Customers will now see the enabled options.')}catch(e){toast(e.message)}}
-function renderChatbotSettings(){const c=CURRENT_BIZ.chatbot||{};document.getElementById('chatbotPersona').value=c.persona||'friendly';document.getElementById('chatbotGreeting').value=c.greeting||`Hi! Thanks for visiting ${CURRENT_BIZ.name}. How can I help?`}
-async function saveChatbotSettings(){try{const r=await fmgApi('/business/settings',{method:'PUT',body:JSON.stringify({chatbot:{persona:document.getElementById('chatbotPersona').value,greeting:document.getElementById('chatbotGreeting').value.trim()}})});CURRENT_BIZ=r.business;toast('Assistant settings saved.')}catch(e){toast(e.message)}}
-async function loadBusinessMessages(){const box=document.getElementById('messagesList');try{const r=await fmgApi('/messages/'+CURRENT_BIZ.id);const groups={};r.messages.forEach(m=>(groups[m.userId]??=[]).push(m));box.innerHTML=Object.keys(groups).length?Object.entries(groups).map(([uid,msgs])=>`<div class="panel" style="margin-bottom:12px;padding:14px"><strong>Customer ${esc(uid)}</strong><div style="max-height:180px;overflow:auto;margin:8px 0">${msgs.map(m=>`<div style="padding:7px;background:${m.from==='business'?'#F0ECE7':'#FFF6DF'};margin:5px 0"><strong>${m.from==='business'?'Business':'Customer'}:</strong> ${esc(m.text)}<small style="display:block;color:#6B625B">${new Date(m.createdAt).toLocaleString()}</small></div>`).join('')}</div><div class="field"><input id="reply_${uid}" placeholder="Reply to this customer"></div><button class="btn btn-primary btn-sm" onclick="replyToCustomer('${uid}')">Send reply</button></div>`).join(''):'<p class="form-note">No direct customer messages yet.</p>'}catch(e){toast(e.message)}}
-async function replyToCustomer(userId){const input=document.getElementById('reply_'+userId),text=input.value.trim();if(!text)return;try{await fmgApi('/messages/'+CURRENT_BIZ.id+'/reply',{method:'POST',body:JSON.stringify({userId,text})});input.value='';await loadBusinessMessages();toast('Reply delivered to the customer.')}catch(e){toast(e.message)}}
-let chartCache={};function renderChart(canvasId,type){const c=document.getElementById(canvasId);if(!c||typeof Chart==='undefined')return;const lines=DASH.lines||[],months={};for(let i=5;i>=0;i--){const d=new Date();d.setMonth(d.getMonth()-i);months[d.toISOString().slice(0,7)]=0}lines.forEach(l=>{const k=l.date.slice(0,7);if(k in months)months[k]+=l.lineTotal});if(chartCache[canvasId])chartCache[canvasId].destroy();chartCache[canvasId]=new Chart(c.getContext('2d'),{type,data:{labels:Object.keys(months),datasets:[{label:'Sales (UGX)',data:Object.values(months),borderColor:'#E8A93B',backgroundColor:'#3B2417',fill:type==='line',tension:.25}]},options:{plugins:{legend:{display:false}}}})}
-function logout(){FMG.clearSession();location.href='index.html'}
-document.addEventListener('DOMContentLoaded',async()=>{CURRENT_BIZ=await guardBusinessSession();if(!CURRENT_BIZ)return;try{DASH=await refreshDash()}catch(e){toast(e.message)};document.querySelectorAll('.dash-nav a[data-section]').forEach(a=>a.onclick=e=>{e.preventDefault();showSection(a.dataset.section)});document.getElementById('publicSiteBtn')?.addEventListener('click',openPublicSite);document.getElementById('logoutBtn').onclick=logout;document.getElementById('addProductBtn').onclick=()=>openProductForm();document.getElementById('productFormClose').onclick=closeProductForm;document.getElementById('productFormSave').onclick=saveProductForm;document.getElementById('imageInput').onchange=e=>handleImageSelect(e.target);document.getElementById('chatbotSaveBtn').onclick=saveChatbotSettings;document.getElementById('paymentMethodsSaveBtn').onclick=savePaymentMethods;document.getElementById('locationSettingsList').addEventListener('change',()=>renderLocationChips());document.getElementById('sec-locations').insertAdjacentHTML('afterbegin','<div style="margin-bottom:14px"><button class="btn btn-primary btn-sm" id="saveLocationSettingsBtn">Save delivery points and fees</button></div>');document.getElementById('saveLocationSettingsBtn').onclick=saveBusinessLocations;showSection('sec-overview')});
+/* ============================================================
+   CAMPUS MARKET — dashboard.js (business dashboard)
+   ============================================================ */
+
+let CURRENT_BIZ = null;
+let selectedLocations = [];
+
+function guardBusinessSession() {
+  const session = FMG.getSession();
+  if (!session || session.type !== "business") {
+    window.location.href = "index.html";
+    return null;
+  }
+  const biz = FMG.businessById(session.id);
+  if (!biz) { FMG.clearSession(); window.location.href = "index.html"; return null; }
+  return biz;
+}
+
+function trialStatus(biz) {
+  if (!biz.freeTrial) return { active: false, label: "Standard subscription", expired: false };
+  const today = new Date();
+  const end = new Date(biz.trialEndsAt);
+  const active = today <= end;
+  const daysLeft = Math.max(0, Math.ceil((end - today) / 86400000));
+  return { active, expired: !active, label: active ? `Free trial · ${daysLeft} days left` : "Free trial ended", daysLeft };
+}
+
+function bizProducts() { return FMG.getProducts().filter(p => p.bizId === CURRENT_BIZ.id); }
+function bizOrderLines() {
+  const products = bizProducts();
+  const ids = new Set(products.map(p => p.id));
+  const lines = [];
+  FMG.getOrders().forEach(order => {
+    order.items.forEach(item => {
+      if (ids.has(item.productId)) {
+        const p = products.find(x => x.id === item.productId);
+        const price = p.discount ? Math.round(p.price * (1 - p.discount / 100)) : p.price;
+        lines.push({ orderId: order.id, date: order.createdAt, productName: p.name, qty: item.qty, revenue: price * item.qty, location: order.location });
+      }
+    });
+  });
+  return lines;
+}
+
+/* ---------- section switching ---------- */
+function showSection(id) {
+  document.querySelectorAll(".dash-section").forEach(s => s.classList.add("hidden"));
+  document.getElementById(id).classList.remove("hidden");
+  document.querySelectorAll(".dash-nav a").forEach(a => a.classList.toggle("active", a.dataset.section === id));
+  if (id === "sec-progression") renderProgressionChart();
+  if (id === "sec-sales") renderSalesChart();
+  if (id === "sec-locations") setTimeout(initMap, 50);
+}
+
+/* ---------- overview ---------- */
+function renderOverview() {
+  const products = bizProducts();
+  const lines = bizOrderLines();
+  const revenue = lines.reduce((s, l) => s + l.revenue, 0);
+  const unitsSold = lines.reduce((s, l) => s + l.qty, 0);
+  const lowStock = products.filter(p => p.stock > 0 && p.stock <= 5).length;
+  document.getElementById("kpiRevenue").textContent = money(revenue);
+  document.getElementById("kpiProducts").textContent = products.length;
+  document.getElementById("kpiUnits").textContent = unitsSold;
+  document.getElementById("kpiLowStock").textContent = lowStock;
+
+  const notes = fmgLoad("fmg_biz_notifications", []).filter(n => n.bizId === CURRENT_BIZ.id).slice(0, 6);
+  document.getElementById("notificationList").innerHTML = notes.length
+    ? notes.map(n => `<li>${n.message} <span style="color:rgba(33,26,22,0.5);font-size:0.76rem;">· ${new Date(n.at).toLocaleString()}</span></li>`).join("")
+    : "<li>No notifications yet — they will appear here when shoppers add your products to cart.</li>";
+}
+
+/* ---------- products ---------- */
+function renderProductsTable() {
+  const products = bizProducts();
+  const tbody = document.getElementById("productsTableBody");
+  if (products.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6">No products yet. Use "Upload product" to add your first listing.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = products.map(p => {
+    const badge = p.stock === 0 ? '<span class="badge-chip badge-out">Out of stock</span>' :
+      (p.stock <= 5 ? '<span class="badge-chip badge-low">Low stock</span>' : '<span class="badge-chip badge-in">In stock</span>');
+    return `<tr>
+      <td><img src="${p.image}" alt="${p.name}" style="width:44px;height:44px;object-fit:cover;border-radius:3px;"></td>
+      <td>${p.name}<br><span style="color:rgba(33,26,22,0.55);font-size:0.78rem;">${FMG.categoryById(p.category)?.label || p.category}</span></td>
+      <td>${money(p.price)}${p.discount ? ` <span style="color:var(--navy);">(-${p.discount}%)</span>` : ""}</td>
+      <td>${p.stock} ${badge}</td>
+      <td>${p.views || 0}</td>
+      <td>
+        <button class="btn btn-outline-dark btn-sm" onclick="openProductForm('${p.id}')">Edit</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteBizProduct('${p.id}')">Delete</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+function deleteBizProduct(id) {
+  if (!confirm("Remove this product from your storefront?")) return;
+  FMG.saveProducts(FMG.getProducts().filter(p => p.id !== id));
+  renderProductsTable();
+  renderOverview();
+}
+
+let editingProductId = null;
+let pendingImageDataUrl = null;
+
+function openProductForm(id) {
+  editingProductId = id || null;
+  pendingImageDataUrl = null;
+  const p = id ? FMG.getProducts().find(x => x.id === id) : null;
+  document.getElementById("productFormTitle").textContent = p ? "Edit product" : "Upload product";
+  document.getElementById("pfName").value = p ? p.name : "";
+  document.getElementById("pfCategory").value = p ? p.category : FMG.categories[0].id;
+  document.getElementById("pfPrice").value = p ? p.price : "";
+  document.getElementById("pfDiscount").value = p ? p.discount : 0;
+  document.getElementById("pfStock").value = p ? p.stock : "";
+  document.getElementById("pfDesc").value = p ? p.desc : "";
+  document.getElementById("uploadPreview").src = p ? p.image : FMG.placeholder(FMG.categories[0].id, "New");
+  document.getElementById("pfDeliveryEnabled").checked = p ? !!p.deliveryEnabled : false;
+  renderDeliveryFeeInputs(p ? p.deliveryFees || {} : {});
+  toggleDeliveryFeeInputs();
+  document.getElementById("productFormOverlay").classList.remove("hidden");
+}
+function closeProductForm() { document.getElementById("productFormOverlay").classList.add("hidden"); }
+
+// The fee list only offers the towns this business already ticked in "Delivery & pickup" (section 7.6),
+// so a business can't promise a fee for a point it doesn't actually serve.
+function renderDeliveryFeeInputs(existingFees) {
+  const bizLocationIds = fmgLoad("fmg_biz_locations_" + CURRENT_BIZ.id, [CURRENT_BIZ.location]);
+  const box = document.getElementById("deliveryFeeInputs");
+  if (bizLocationIds.length === 0) {
+    box.innerHTML = `<p class="form-note">You haven't selected any delivery/pickup towns yet — add some under "Delivery & pickup" first.</p>`;
+    return;
+  }
+  box.innerHTML = bizLocationIds.map(locId => {
+    const loc = FMG.locationById(locId);
+    const fee = existingFees[locId] || 0;
+    return `<div class="field-row" style="align-items:end;">
+      <div class="field" style="margin-bottom:8px;"><label>${loc ? loc.label : locId}</label>
+        <input type="number" min="0" max="${FMG.maxDeliveryFee}" step="500" class="pf-delivery-fee" data-loc="${locId}" value="${fee}">
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function toggleDeliveryFeeInputs() {
+  document.getElementById("deliveryFeeSection").classList.toggle("hidden", !document.getElementById("pfDeliveryEnabled").checked);
+}
+
+function handleImageSelect(input) {
+  const file = input.files[0];
+  if (!file) return;
+  // Resize/compress client-side so uploads never bloat the page or slow the site down.
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const img = new Image();
+    img.onload = () => {
+      const maxDim = 700;
+      let { width, height } = img;
+      if (width > height && width > maxDim) { height *= maxDim / width; width = maxDim; }
+      else if (height > maxDim) { width *= maxDim / height; height = maxDim; }
+      const canvas = document.createElement("canvas");
+      canvas.width = width; canvas.height = height;
+      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      pendingImageDataUrl = canvas.toDataURL("image/jpeg", 0.72);
+      document.getElementById("uploadPreview").src = pendingImageDataUrl;
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+function saveProductForm() {
+  const name = document.getElementById("pfName").value.trim();
+  const category = document.getElementById("pfCategory").value;
+  const price = Number(document.getElementById("pfPrice").value);
+  const discount = Number(document.getElementById("pfDiscount").value) || 0;
+  const stock = Number(document.getElementById("pfStock").value);
+  const desc = document.getElementById("pfDesc").value.trim();
+  const deliveryEnabled = document.getElementById("pfDeliveryEnabled").checked;
+  const errEl = document.getElementById("productFormError");
+  if (!name || !price || price <= 0 || isNaN(stock) || stock < 0) {
+    errEl.textContent = "Please fill in a product name, a price above zero, and stock quantity.";
+    errEl.classList.remove("hidden");
+    return;
+  }
+
+  // Read the per-town delivery fees and hard-enforce the UGX 10,000 cap before saving anything.
+  const deliveryFees = {};
+  let feeError = "";
+  document.querySelectorAll(".pf-delivery-fee").forEach(input => {
+    const fee = Number(input.value) || 0;
+    if (fee > FMG.maxDeliveryFee) feeError = `Delivery fee for ${input.closest(".field").querySelector("label").textContent} cannot exceed UGX ${FMG.maxDeliveryFee.toLocaleString()}.`;
+    if (fee > 0) deliveryFees[input.dataset.loc] = Math.min(fee, FMG.maxDeliveryFee);
+  });
+  if (deliveryEnabled && feeError) {
+    errEl.textContent = feeError;
+    errEl.classList.remove("hidden");
+    return;
+  }
+
+  errEl.classList.add("hidden");
+  const products = FMG.getProducts();
+  if (editingProductId) {
+    const idx = products.findIndex(p => p.id === editingProductId);
+    products[idx] = { ...products[idx], name, category, price, discount, stock, desc, deliveryEnabled, deliveryFees,
+      image: pendingImageDataUrl || products[idx].image };
+  } else {
+    products.push({
+      id: FMG.uid("prod"), name, category, price, discount, stock, desc, bizId: CURRENT_BIZ.id,
+      deliveryEnabled, deliveryFees,
+      image: pendingImageDataUrl || FMG.placeholder(category, name),
+      createdAt: new Date().toISOString(), views: 0
+    });
+  }
+  FMG.saveProducts(products);
+  closeProductForm();
+  renderProductsTable();
+  renderOverview();
+  toast(editingProductId ? "Product updated." : "Product uploaded — now visible on the public site.");
+}
+
+/* ---------- orders / sales per month ---------- */
+function renderOrdersTable() {
+  const lines = bizOrderLines().sort((a, b) => new Date(b.date) - new Date(a.date));
+  const tbody = document.getElementById("ordersTableBody");
+  if (lines.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5">No sales yet.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = lines.map(l => `
+    <tr>
+      <td>${new Date(l.date).toLocaleDateString()}</td>
+      <td>${l.productName}</td>
+      <td>${l.qty}</td>
+      <td>${FMG.locationById(l.location)?.label || l.location}</td>
+      <td>${money(l.revenue)}</td>
+    </tr>`).join("");
+}
+
+function monthKey(d) { const dt = new Date(d); return dt.getFullYear() + "-" + String(dt.getMonth() + 1).padStart(2, "0"); }
+function monthLabel(key) {
+  const [y, m] = key.split("-");
+  return new Date(y, m - 1, 1).toLocaleString("default", { month: "short", year: "2-digit" });
+}
+
+function monthlyRevenueSeries() {
+  const lines = bizOrderLines();
+  const map = {};
+  const now = new Date();
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    map[monthKey(d)] = 0;
+  }
+  lines.forEach(l => { const k = monthKey(l.date); if (k in map) map[k] += l.revenue; });
+  // Demo baseline so a fresh business still sees a meaningful trend line.
+  Object.keys(map).forEach((k, idx) => { if (map[k] === 0) map[k] = Math.round(150000 + idx * 60000 + Math.random() * 90000); });
+  return Object.entries(map).map(([k, v]) => ({ label: monthLabel(k), value: v }));
+}
+
+let progressionChart, salesChart;
+function renderProgressionChart() {
+  const series = monthlyRevenueSeries();
+  const ctx = document.getElementById("progressionCanvas").getContext("2d");
+  if (progressionChart) progressionChart.destroy();
+  progressionChart = new Chart(ctx, {
+    type: "line",
+    data: { labels: series.map(s => s.label), datasets: [{ label: "Revenue (UGX)", data: series.map(s => s.value), borderColor: "#E8A93B", backgroundColor: "rgba(232,169,59,0.18)", fill: true, tension: 0.3 }] },
+    options: { plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: v => (v / 1000) + "k" } } } }
+  });
+}
+function renderSalesChart() {
+  const series = monthlyRevenueSeries();
+  const ctx = document.getElementById("salesCanvas").getContext("2d");
+  if (salesChart) salesChart.destroy();
+  salesChart = new Chart(ctx, {
+    type: "bar",
+    data: { labels: series.map(s => s.label), datasets: [{ label: "Sales (UGX)", data: series.map(s => s.value), backgroundColor: "#1B2A4A" }] },
+    options: { plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: v => (v / 1000) + "k" } } } }
+  });
+}
+
+/* ---------- income statement / balance sheet ---------- */
+function renderFinance() {
+  const lines = bizOrderLines();
+  const revenue = lines.reduce((s, l) => s + l.revenue, 0);
+  const cogs = Math.round(revenue * 0.6);
+  const grossProfit = revenue - cogs;
+  const status = trialStatus(CURRENT_BIZ);
+  const platformFeeRate = status.active ? 0 : 0.05;
+  const platformFee = Math.round(revenue * platformFeeRate);
+  const netProfit = grossProfit - platformFee;
+
+  document.getElementById("incomeStatement").innerHTML = `
+    <table class="data-table">
+      <tr><td>Sales revenue</td><td style="text-align:right;">${money(revenue)}</td></tr>
+      <tr><td>Estimated cost of goods sold</td><td style="text-align:right;">(${money(cogs)})</td></tr>
+      <tr><th>Gross profit</th><th style="text-align:right;">${money(grossProfit)}</th></tr>
+      <tr><td>Platform fee ${status.active ? "(waived — free trial)" : "(5%)"}</td><td style="text-align:right;">(${money(platformFee)})</td></tr>
+      <tr><th>Net profit</th><th style="text-align:right;">${money(netProfit)}</th></tr>
+    </table>
+    <p class="form-note">Cost of goods and fees are estimates for demonstration. Connect real accounting figures once a backend is in place.</p>`;
+
+  const products = bizProducts();
+  const inventoryValue = products.reduce((s, p) => s + p.price * p.stock, 0);
+  const cash = revenue;
+  const totalAssets = inventoryValue + cash;
+  const liabilities = status.expired ? Math.round(revenue * 0.05) : 0;
+  const equity = totalAssets - liabilities;
+
+  document.getElementById("balanceSheet").innerHTML = `
+    <table class="data-table">
+      <tr><th colspan="2">Assets</th></tr>
+      <tr><td>Cash from sales</td><td style="text-align:right;">${money(cash)}</td></tr>
+      <tr><td>Inventory on hand (at listed price)</td><td style="text-align:right;">${money(inventoryValue)}</td></tr>
+      <tr><th>Total assets</th><th style="text-align:right;">${money(totalAssets)}</th></tr>
+      <tr><th colspan="2">Liabilities &amp; equity</th></tr>
+      <tr><td>Platform fees owed</td><td style="text-align:right;">${money(liabilities)}</td></tr>
+      <tr><th>Owner's equity</th><th style="text-align:right;">${money(equity)}</th></tr>
+    </table>`;
+}
+
+/* ---------- delivery & pickup locations ---------- */
+function renderLocationChips() {
+  selectedLocations = fmgLoad("fmg_biz_locations_" + CURRENT_BIZ.id, [CURRENT_BIZ.location]);
+  const list = document.getElementById("locationChips");
+  list.innerHTML = FMG.locations.map(l => `
+    <button type="button" class="location-chip ${selectedLocations.includes(l.id) ? "selected" : ""}" data-loc="${l.id}">${l.label}</button>`).join("");
+  list.querySelectorAll(".location-chip").forEach(btn => {
+    btn.onclick = () => {
+      const loc = btn.dataset.loc;
+      if (selectedLocations.includes(loc)) selectedLocations = selectedLocations.filter(x => x !== loc);
+      else selectedLocations.push(loc);
+      fmgSave("fmg_biz_locations_" + CURRENT_BIZ.id, selectedLocations);
+      btn.classList.toggle("selected");
+      initMap();
+    };
+  });
+}
+
+let bizMap = null;
+function initMap() {
+  const el = document.getElementById("map");
+  if (!el || typeof L === "undefined") return;
+  if (bizMap) { bizMap.remove(); bizMap = null; }
+  bizMap = L.map("map").setView([0.0, 31.9], 8);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "&copy; OpenStreetMap contributors", maxZoom: 17
+  }).addTo(bizMap);
+  FMG.locations.forEach(loc => {
+    const active = selectedLocations.includes(loc.id);
+    const marker = L.circleMarker([loc.lat, loc.lng], {
+      radius: active ? 9 : 6, color: active ? "#E8A93B" : "#1B2A4A", fillColor: active ? "#E8A93B" : "#1B2A4A", fillOpacity: 0.85
+    }).addTo(bizMap);
+    marker.bindPopup(`<strong>${loc.label}</strong><br>${active ? "Active pickup/delivery point" : "Not selected"}`);
+  });
+}
+
+/* ---------- messages: two-way threads with shoppers ---------- */
+function renderMessages() {
+  const threads = FMG.getThreads().filter(t => t.bizId === CURRENT_BIZ.id)
+    .sort((a, b) => new Date(b.messages.at(-1)?.at || b.createdAt) - new Date(a.messages.at(-1)?.at || a.createdAt));
+  const list = document.getElementById("messagesList");
+  list.innerHTML = threads.length ? threads.map(t => `
+    <div class="panel" style="margin-bottom:10px;padding:14px 16px;">
+      <strong>${t.userName}</strong>
+      ${t.unreadForBiz ? '<span class="badge-chip badge-low" style="margin-left:6px;">New</span>' : ""}
+      <div style="max-height:180px;overflow-y:auto;margin:10px 0;display:flex;flex-direction:column;gap:6px;">
+        ${t.messages.map(m => `<div class="chat-msg ${m.from === "business" ? "user" : "bot"}" style="align-self:${m.from === "business" ? "flex-end" : "flex-start"};max-width:85%;">${m.text}</div>`).join("")}
+      </div>
+      <div style="display:flex;gap:8px;">
+        <input type="text" id="reply-${t.id}" placeholder="Write a reply..." style="flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:4px;">
+        <button class="btn btn-primary btn-sm" onclick="replyToThread('${t.id}')">Send</button>
+      </div>
+    </div>`).join("")
+    : `<p style="color:rgba(33,26,22,0.6);">No messages from shoppers yet — they'll appear here after using "Message seller" on one of your products.</p>`;
+}
+
+function replyToThread(threadId) {
+  const input = document.getElementById("reply-" + threadId);
+  const text = input.value.trim();
+  if (!text) return;
+  const threads = FMG.getThreads();
+  const idx = threads.findIndex(t => t.id === threadId);
+  if (idx === -1) return;
+  threads[idx].messages.push({ from: "business", text, at: new Date().toISOString() });
+  threads[idx].unreadForBiz = false;
+  threads[idx].unreadForUser = true; // this is what lets the shopper's browser pick up the reply
+  FMG.saveThreads(threads);
+  renderMessages();
+  toast("Reply sent to " + threads[idx].userName + ".");
+}
+
+/* ---------- chatbot settings ---------- */
+function renderChatbotSettings() {
+  const saved = fmgLoad("fmg_biz_chatbot_" + CURRENT_BIZ.id, { persona: "friendly", greeting: `Hi! Thanks for visiting ${CURRENT_BIZ.name}. How can I help?` });
+  document.getElementById("chatbotPersona").value = saved.persona;
+  document.getElementById("chatbotGreeting").value = saved.greeting;
+}
+function saveChatbotSettings() {
+  const persona = document.getElementById("chatbotPersona").value;
+  const greeting = document.getElementById("chatbotGreeting").value.trim();
+  fmgSave("fmg_biz_chatbot_" + CURRENT_BIZ.id, { persona, greeting });
+  toast("Chat assistant settings saved.");
+}
+
+/* ---------- payment methods this business accepts from shoppers ----------
+   Shown at public checkout via FMG.commonOfferedMethods() — a method only
+   counts as "offered" once it's both switched on AND has an account number
+   filled in, so a half-configured toggle can't be selected by a shopper. */
+function renderPaymentMethodsForm() {
+  const pm = CURRENT_BIZ.paymentMethods || FMG.emptyPaymentMethods();
+  const box = document.getElementById("paymentMethodsForm");
+  box.innerHTML = FMG.paymentMethods.map(m => {
+    const entry = pm[m.id] || { enabled: false, [m.field]: "" };
+    return `
+    <div class="field" style="border:1px solid var(--line);border-radius:4px;padding:12px 14px;margin-bottom:10px;">
+      <label style="display:flex;align-items:center;gap:8px;font-size:0.95rem;">
+        <input type="checkbox" id="pm-${m.id}-enabled" ${entry.enabled ? "checked" : ""} style="width:auto;">
+        ${m.label}
+      </label>
+      <input type="text" id="pm-${m.id}-value" placeholder="${m.fieldLabel}" value="${entry[m.field] || ""}" style="margin-top:8px;">
+    </div>`;
+  }).join("");
+}
+
+function savePaymentMethodsForm() {
+  const paymentMethods = {};
+  FMG.paymentMethods.forEach(m => {
+    const enabled = document.getElementById(`pm-${m.id}-enabled`).checked;
+    const value = document.getElementById(`pm-${m.id}-value`).value.trim();
+    paymentMethods[m.id] = { enabled, [m.field]: value };
+  });
+  const businesses = FMG.getBusinesses();
+  const idx = businesses.findIndex(b => b.id === CURRENT_BIZ.id);
+  businesses[idx] = { ...businesses[idx], paymentMethods };
+  FMG.saveBusinesses(businesses);
+  CURRENT_BIZ = businesses[idx];
+  toast("Payment methods saved — shoppers will see whichever ones have an account number filled in.");
+}
+
+/* ---------- bootstrap ---------- */
+document.addEventListener("DOMContentLoaded", () => {
+  CURRENT_BIZ = guardBusinessSession();
+  if (!CURRENT_BIZ) return;
+
+  document.getElementById("bizNameLabel").textContent = CURRENT_BIZ.name;
+  const status = trialStatus(CURRENT_BIZ);
+  const pill = document.getElementById("trialPill");
+  pill.textContent = status.label;
+  pill.classList.toggle("expired", status.expired);
+
+  renderOverview();
+  renderProductsTable();
+  renderOrdersTable();
+  renderFinance();
+  renderLocationChips();
+  renderMessages();
+  renderChatbotSettings();
+  renderPaymentMethodsForm();
+
+  document.querySelectorAll(".dash-nav a[data-section]").forEach(a => {
+    a.addEventListener("click", (e) => { e.preventDefault(); showSection(a.dataset.section); });
+  });
+  document.getElementById("logoutBtn").onclick = logout;
+  document.getElementById("addProductBtn").onclick = () => openProductForm(null);
+  document.getElementById("productFormClose").onclick = closeProductForm;
+  document.getElementById("productFormSave").onclick = saveProductForm;
+  document.getElementById("imageInput").addEventListener("change", (e) => handleImageSelect(e.target));
+  document.getElementById("chatbotSaveBtn").onclick = saveChatbotSettings;
+  document.getElementById("pfDeliveryEnabled").addEventListener("change", toggleDeliveryFeeInputs);
+  document.getElementById("paymentMethodsSaveBtn").onclick = savePaymentMethodsForm;
+
+  showSection("sec-overview");
+
+  // When cloud sync is on, another device's changes (a shopper's order landing,
+  // an admin edit, etc.) arrive here in the background — keep the numbers fresh.
+  document.addEventListener("fmg:updated", (e) => {
+    if (!CURRENT_BIZ) return;
+    if (e.detail.key === "fmg_businesses") {
+      const refreshed = FMG.businessById(CURRENT_BIZ.id);
+      if (refreshed) CURRENT_BIZ = refreshed;
+    }
+    if (e.detail.key === "fmg_threads") renderMessages();
+    renderOverview();
+    renderProductsTable();
+    renderOrdersTable();
+    renderFinance();
+    renderMessages();
+  });
+});
