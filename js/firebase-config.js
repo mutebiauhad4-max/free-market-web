@@ -1,5 +1,5 @@
 /* ============================================================
-   THE FREE MARKET GLOBE — firebase-config.js
+   CAMPUS MARKET — firebase-config.js
 
    WHY THIS FILE EXISTS
    ---------------------
@@ -19,7 +19,7 @@
    ---------------------------------------------------------------
    1. Go to https://console.firebase.google.com and sign in with any
       Google account.
-   2. Click "Add project", give it any name (e.g. "free-market-globe"),
+   2. Click "Add project", give it any name (e.g. "campus-market"),
       and finish the wizard (you can turn Google Analytics off).
    3. Inside the project, click the "</>" (Web) icon to register a
       web app. Give it a nickname and click "Register app". Firebase
@@ -37,21 +37,14 @@
    Leaving FMG_CLOUD_ENABLED as false keeps the site fully working
    exactly as before (single-device demo mode, using localStorage).
    ============================================================ */
-import { initializeApp } from "https://gstatic.com";
-import { getDatabase } from "https://gstatic.com";
-const FMG_CLOUD_ENABLED = true;
+
+const FMG_CLOUD_ENABLED = false;
 
 const FMG_FIREBASE_CONFIG = {
-  apiKey: "AIzaSyALRuZ4MIpjmlMWr4s4ecR-s9q_Uua42Y8",
-  authDomain: "://firebaseapp.com",
-  projectId: "free-market-globe",
-  storageBucket: "free-market-globe.firebasestorage.app",
-  messagingSenderId: "95844450755",
-  appId: "1:95844450755:web:03ae7a7c9d6aba5b867d76"
+  apiKey: "PASTE_YOUR_API_KEY_HERE",
+  authDomain: "PASTE_YOUR_PROJECT_ID.firebaseapp.com",
+  projectId: "PASTE_YOUR_PROJECT_ID",
+  storageBucket: "PASTE_YOUR_PROJECT_ID.appspot.com",
+  messagingSenderId: "PASTE_YOUR_SENDER_ID",
+  appId: "PASTE_YOUR_APP_ID"
 };
-firebase.initializeApp(firebaseConfig);
-window.fmgDB = firebase.firestore();
-window.fmgCloudReady = true; 
-
-console.log("Firebase Cloud Layer Activated for Campus Market!");
-
