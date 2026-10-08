@@ -183,14 +183,13 @@
   </div>
 </div>
 
-<!-- Optional shared-database sync: see js/firebase-config.js for the free 5-minute setup.
-     Harmless to leave in even if you never turn it on. -->
-<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
-<!-- Ensure the script elements load in this exact order to prevent timing errors -->
+<!-- Ensure the administrative script nodes load as asynchronous modules -->
+<script src="https://gstatic.com"></script>
+<script src="https://gstatic.com"></script>
 <script type="module" src="js/firebase-config.js"></script>
 <script type="module" src="js/data.js"></script>
 <script type="module" src="js/main.js"></script>
 <script type="module" src="js/admin.js"></script>
+<script src="https://cloudflare.com"></script>
 </body>
 </html>
