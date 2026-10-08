@@ -37,7 +37,8 @@
    Leaving FMG_CLOUD_ENABLED as false keeps the site fully working
    exactly as before (single-device demo mode, using localStorage).
    ============================================================ */
-
+import { initializeApp } from "https://gstatic.com";
+import { getDatabase } from "https://gstatic.com";
 const FMG_CLOUD_ENABLED = true;
 
 const FMG_FIREBASE_CONFIG = {
@@ -48,4 +49,5 @@ const FMG_FIREBASE_CONFIG = {
   messagingSenderId: "95844450755",
   appId: "1:95844450755:web:03ae7a7c9d6aba5b867d76"
 };
-
+const app = initializeApp(firebaseConfig);
+export const db = getDatabase(app);
