@@ -171,7 +171,7 @@ function handleImageSelect(input) {
   reader.readAsDataURL(file);
 }
 
-function saveProductForm() {
+async function saveProductForm() {
   const name = document.getElementById("pfName").value.trim();
   const category = document.getElementById("pfCategory").value;
   const price = Number(document.getElementById("pfPrice").value);
@@ -180,13 +180,14 @@ function saveProductForm() {
   const desc = document.getElementById("pfDesc").value.trim();
   const deliveryEnabled = document.getElementById("pfDeliveryEnabled").checked;
   const errEl = document.getElementById("productFormError");
+  const saveBtn = document.getElementById("productFormSave");
+
   if (!name || !price || price <= 0 || isNaN(stock) || stock < 0) {
     errEl.textContent = "Please fill in a product name, a price above zero, and stock quantity.";
     errEl.classList.remove("hidden");
     return;
   }
 
-  // Read the per-town delivery fees and hard-enforce the UGX 10,000 cap before saving anything.
   const deliveryFees = {};
   let feeError = "";
   document.querySelectorAll(".pf-delivery-fee").forEach(input => {
@@ -202,23 +203,56 @@ function saveProductForm() {
 
   errEl.classList.add("hidden");
   const products = FMG.getProducts();
-  if (editingProductId) {
-    const idx = products.findIndex(p => p.id === editingProductId);
-    products[idx] = { ...products[idx], name, category, price, discount, stock, desc, deliveryEnabled, deliveryFees,
-      image: pendingImageDataUrl || products[idx].image };
-  } else {
-    products.push({
-      id: FMG.uid("prod"), name, category, price, discount, stock, desc, bizId: CURRENT_BIZ.id,
+  const existing = editingProductId ? products.find(p => p.id === editingProductId) : null;
+  const productId = editingProductId || FMG.uid("prod");
+  let imageUrl = existing ? existing.image : FMG.placeholder(category, name);
+
+  try {
+    saveBtn.disabled = true;
+    saveBtn.textContent = pendingImageDataUrl ? "Uploading photo…" : "Saving…";
+
+    // Real photos go to Firebase Storage. Firestore stores only the public download URL,
+    // preventing large base64 images from hitting Firestore's 1 MiB document limit.
+    if (pendingImageDataUrl) {
+      imageUrl = await FMG.uploadImageDataUrl(
+        pendingImageDataUrl,
+        `products/${CURRENT_BIZ.id}/${productId}.jpg`
+      );
+    }
+
+    const record = {
+      ...(existing || {}),
+      id: productId,
+      name, category, price, discount, stock, desc,
+      bizId: CURRENT_BIZ.id,
       deliveryEnabled, deliveryFees,
-      image: pendingImageDataUrl || FMG.placeholder(category, name),
-      createdAt: new Date().toISOString(), views: 0
-    });
+      image: imageUrl,
+      createdAt: existing?.createdAt || new Date().toISOString(),
+      views: existing?.views || 0
+    };
+
+    if (editingProductId) {
+      const idx = products.findIndex(p => p.id === editingProductId);
+      if (idx === -1) throw new Error("This product no longer exists. Refresh the dashboard and try again.");
+      products[idx] = record;
+    } else {
+      products.push(record);
+    }
+
+    FMG.saveProducts(products);
+    pendingImageDataUrl = null;
+    closeProductForm();
+    renderProductsTable();
+    renderOverview();
+    toast(editingProductId ? "Product updated and saved to Firebase." : "Product uploaded and published to the shared public site.");
+  } catch (err) {
+    console.error("Product upload failed:", err);
+    errEl.textContent = "Upload failed: " + (err.message || "Firebase Storage/Firestore rejected the request.");
+    errEl.classList.remove("hidden");
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.textContent = "Save product";
   }
-  FMG.saveProducts(products);
-  closeProductForm();
-  renderProductsTable();
-  renderOverview();
-  toast(editingProductId ? "Product updated." : "Product uploaded — now visible on the public site.");
 }
 
 /* ---------- orders / sales per month ---------- */
