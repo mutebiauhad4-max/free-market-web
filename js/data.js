@@ -89,6 +89,10 @@ function fmgNotifyUpdated(key) {
 function fmgWatchList(collectionName, localKey) {
   fmgDB.collection(collectionName).onSnapshot(
     snap => {
+      // An empty reading that came only from the browser's cache, or that arrives while this device
+      // still holds unsynced data, is not proof the cloud is empty: never let it wipe local data.
+      const localCount = (fmgLoad(localKey, []) || []).length;
+      if (snap.empty && ((snap.metadata && snap.metadata.fromCache) || (localCount > 0 && !fmgSeedOK[localKey]))) return;
       const items = snap.docs.map(d => d.data());
       fmgSave(localKey, items);
       fmgNotifyUpdated(localKey);
@@ -96,10 +100,10 @@ function fmgWatchList(collectionName, localKey) {
     err => console.error("Cloud sync (read) failed for", collectionName, err)
   );
 }
-
 function fmgWatchMeta(docId, localKey, fallback) {
   fmgDB.collection("fmg_meta").doc(docId).onSnapshot(
     doc => {
+      if (!doc.exists && ((doc.metadata && doc.metadata.fromCache) || !fmgSeedOK[localKey])) return;
       const value = doc.exists ? doc.data().value : fallback;
       fmgSave(localKey, value);
       fmgNotifyUpdated(localKey);
@@ -141,25 +145,47 @@ function fmgSyncMetaToCloud(docId, value) {
 // the watcher below would see an empty cloud collection and overwrite — permanently wipe — local
 // data that was never actually lost, just never synced yet. localList is captured synchronously,
 // before any network round-trip, so there is no race with the watcher that gets attached after.
+// Which collections/docs have been confirmed in step with the cloud (so an empty cloud reading can be trusted).
+const fmgSeedOK = {};
+const fmgSleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Runs fn(), retrying a few times if Firebase says it is offline (common right at page load,
+// or on networks/browsers that block Firestore's normal connection).
+async function fmgRetry(fn, label) {
+  const waits = [0, 1500, 3500, 7000];
+  let lastErr;
+  for (const w of waits) {
+    if (w) await fmgSleep(w);
+    try { return await fn(); } catch (e) { lastErr = e; }
+  }
+  console.warn("Cloud sync could not confirm", label, "- keeping this device's data safe and continuing:", lastErr && lastErr.message);
+  throw lastErr;
+}
+
+// If this device already has local data (e.g. a business that signed up before cloud sync was
+// turned on) and the cloud collection is empty, push the local copy up FIRST. Without this the
+// watcher would see an empty cloud and overwrite local data that was only ever never synced.
 function fmgSeedCollectionIfEmpty(collectionName, localKey) {
-  const localList = fmgLoad(localKey, []);
-  if (!Array.isArray(localList) || localList.length === 0) return Promise.resolve();
-  return fmgDB.collection(collectionName).limit(1).get().then(snap => {
-    if (!snap.empty) return; // cloud already has real data — never overwrite it with a stale local copy
+  const localList = fmgLoad(localKey, []);   // captured synchronously, before any network call
+  if (!Array.isArray(localList) || localList.length === 0) { fmgSeedOK[localKey] = true; return Promise.resolve(); }
+  return fmgRetry(async () => {
+    const snap = await fmgDB.collection(collectionName).limit(1).get();
+    if (!snap.empty) return;   // cloud already has real data: never overwrite it with a stale local copy
     const batch = fmgDB.batch();
-    localList.forEach(item => {
-      if (item && item.id) batch.set(fmgDB.collection(collectionName).doc(String(item.id)), item);
-    });
-    return batch.commit();
-  }).catch(err => console.error("Initial cloud seed failed for", collectionName, err));
+    localList.forEach(item => { if (item && item.id) batch.set(fmgDB.collection(collectionName).doc(String(item.id)), item); });
+    await batch.commit();
+  }, collectionName).then(() => { fmgSeedOK[localKey] = true; }).catch(() => {});
 }
 
 function fmgSeedMetaIfEmpty(docId, localKey, fallback) {
   const localValue = fmgLoad(localKey, fallback);
-  return fmgDB.collection("fmg_meta").doc(docId).get().then(doc => {
+  const isDefault = JSON.stringify(localValue) === JSON.stringify(fallback);
+  if (isDefault) { fmgSeedOK[localKey] = true; return Promise.resolve(); }   // nothing worth uploading
+  return fmgRetry(async () => {
+    const doc = await fmgDB.collection("fmg_meta").doc(docId).get();
     if (doc.exists) return;
-    return fmgDB.collection("fmg_meta").doc(docId).set({ value: localValue });
-  }).catch(err => console.error("Initial cloud seed failed for", docId, err));
+    await fmgDB.collection("fmg_meta").doc(docId).set({ value: localValue });
+  }, docId).then(() => { fmgSeedOK[localKey] = true; }).catch(() => {});
 }
 
 function fmgInitCloud() {
@@ -172,6 +198,7 @@ function fmgInitCloud() {
   try {
     firebase.initializeApp(FMG_FIREBASE_CONFIG);
     fmgDB = firebase.firestore();
+    try { fmgDB.settings({ experimentalAutoDetectLongPolling: true, merge: true }); } catch (e) { /* older SDK: ignore */ }
     fmgCloudReady = true;
 
     const seeding = Promise.all([
