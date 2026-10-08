@@ -8,10 +8,22 @@ function money(n) {
 
 /* ---------------- cookie / data-use consent ---------------- */
 function initConsent() {
-    const banner = document.getElementById("dataConsentBanner");
-    if (banner) {
-        banner.classList.remove("hidden");
-    }
+  const banner = document.getElementById("cookieBanner");
+  const consent = FMG.getConsent();
+  if (consent) { banner.classList.add("hidden"); return; }
+  banner.classList.remove("hidden");
+  document.getElementById("consentAccept").onclick = () => {
+    FMG.setConsent({ accepted: true, at: new Date().toISOString() });
+    banner.classList.add("hidden");
+  };
+  document.getElementById("consentDecline").onclick = () => {
+    FMG.setConsent({ accepted: false, at: new Date().toISOString() });
+    banner.classList.add("hidden");
+  };
+  document.getElementById("consentLink").onclick = (e) => {
+    e.preventDefault();
+    openTermsModal();
+  };
 }
 
 function openTermsModal() {
@@ -145,7 +157,6 @@ function openProductModal(productId) {
           <div style="display:flex;gap:10px;margin-top:12px;">
             <button class="btn btn-primary" ${p.stock === 0 ? "disabled" : ""} onclick="addToCartGuarded('${p.id}');document.getElementById('productOverlay').remove();">Add to cart</button>
             <button class="btn btn-outline-dark" onclick="openThreadWithBusiness('${p.bizId}')">Message seller</button>
-            <button class="btn btn-outline-dark" onclick="askBusinessAIAboutProduct('${p.id}')">Ask Business AI</button>
           </div>
         </div>
       </div>
