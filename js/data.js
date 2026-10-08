@@ -1,5 +1,5 @@
 /* ============================================================
-   THE FREE MARKET GLOBE — data.js
+   CAMPUS MARKET — data.js
    Shared data layer. By default everything is stored in the
    browser via localStorage, which is enough to demo the site on
    one device but is never shared between devices or browsers.
@@ -35,6 +35,21 @@ const FMG_LOCATIONS = [
 
 const FMG_FREE_TRIAL_LIMIT = 100;
 const FMG_FREE_TRIAL_MONTHS = 6;
+const FMG_MAX_DELIVERY_FEE = 10000; // UGX — hard cap a business can charge for delivery to any one point
+
+const FMG_PAYMENT_METHODS = [
+  { id: "momo", label: "MTN MoMo Pay", field: "number", fieldLabel: "MoMo phone number" },
+  { id: "airtel", label: "Airtel Pay", field: "number", fieldLabel: "Airtel phone number" },
+  { id: "mastercard", label: "Mastercard", field: "merchantId", fieldLabel: "Merchant ID" }
+];
+
+function fmgEmptyPaymentMethods() {
+  return {
+    momo: { enabled: false, number: "" },
+    airtel: { enabled: false, number: "" },
+    mastercard: { enabled: false, merchantId: "" }
+  };
+}
 
 /* ---------- tiny local "database" helpers ---------- */
 
@@ -121,6 +136,32 @@ function fmgSyncMetaToCloud(docId, value) {
     .catch(err => console.error("Cloud sync (write) failed for", docId, err));
 }
 
+// If this device already has local data (e.g. a business that signed up before cloud sync was
+// turned on) and the cloud collection is still empty, push the local copy up FIRST. Without this,
+// the watcher below would see an empty cloud collection and overwrite — permanently wipe — local
+// data that was never actually lost, just never synced yet. localList is captured synchronously,
+// before any network round-trip, so there is no race with the watcher that gets attached after.
+function fmgSeedCollectionIfEmpty(collectionName, localKey) {
+  const localList = fmgLoad(localKey, []);
+  if (!Array.isArray(localList) || localList.length === 0) return Promise.resolve();
+  return fmgDB.collection(collectionName).limit(1).get().then(snap => {
+    if (!snap.empty) return; // cloud already has real data — never overwrite it with a stale local copy
+    const batch = fmgDB.batch();
+    localList.forEach(item => {
+      if (item && item.id) batch.set(fmgDB.collection(collectionName).doc(String(item.id)), item);
+    });
+    return batch.commit();
+  }).catch(err => console.error("Initial cloud seed failed for", collectionName, err));
+}
+
+function fmgSeedMetaIfEmpty(docId, localKey, fallback) {
+  const localValue = fmgLoad(localKey, fallback);
+  return fmgDB.collection("fmg_meta").doc(docId).get().then(doc => {
+    if (doc.exists) return;
+    return fmgDB.collection("fmg_meta").doc(docId).set({ value: localValue });
+  }).catch(err => console.error("Initial cloud seed failed for", docId, err));
+}
+
 function fmgInitCloud() {
   if (typeof FMG_CLOUD_ENABLED === "undefined" || !FMG_CLOUD_ENABLED) return;
   if (typeof firebase === "undefined") {
@@ -132,13 +173,30 @@ function fmgInitCloud() {
     firebase.initializeApp(FMG_FIREBASE_CONFIG);
     fmgDB = firebase.firestore();
     fmgCloudReady = true;
-    fmgWatchList("fmg_products", "fmg_products");
-    fmgWatchList("fmg_businesses", "fmg_businesses");
-    fmgWatchList("fmg_users", "fmg_users");
-    fmgWatchList("fmg_orders", "fmg_orders");
-    fmgWatchList("fmg_feedback", "fmg_feedback");
-    fmgWatchMeta("payment_accounts", "fmg_payment_accounts", {});
-    fmgWatchMeta("registered_business_count", "fmg_registered_business_count", 0);
+
+    const seeding = Promise.all([
+      fmgSeedCollectionIfEmpty("fmg_products", "fmg_products"),
+      fmgSeedCollectionIfEmpty("fmg_businesses", "fmg_businesses"),
+      fmgSeedCollectionIfEmpty("fmg_users", "fmg_users"),
+      fmgSeedCollectionIfEmpty("fmg_orders", "fmg_orders"),
+      fmgSeedCollectionIfEmpty("fmg_feedback", "fmg_feedback"),
+      fmgSeedCollectionIfEmpty("fmg_threads", "fmg_threads"),
+      fmgSeedMetaIfEmpty("payment_accounts", "fmg_payment_accounts", {}),
+      fmgSeedMetaIfEmpty("registered_business_count", "fmg_registered_business_count", 0)
+    ]);
+
+    // Only start watching (and therefore only start possibly overwriting localStorage) once we
+    // know anything this device already had has either matched the cloud or been pushed up to it.
+    seeding.finally(() => {
+      fmgWatchList("fmg_products", "fmg_products");
+      fmgWatchList("fmg_businesses", "fmg_businesses");
+      fmgWatchList("fmg_users", "fmg_users");
+      fmgWatchList("fmg_orders", "fmg_orders");
+      fmgWatchList("fmg_feedback", "fmg_feedback");
+      fmgWatchList("fmg_threads", "fmg_threads");
+      fmgWatchMeta("payment_accounts", "fmg_payment_accounts", {});
+      fmgWatchMeta("registered_business_count", "fmg_registered_business_count", 0);
+    });
   } catch (e) {
     console.error("Could not start cloud sync — check FMG_FIREBASE_CONFIG. Falling back to local-only mode:", e);
     fmgCloudReady = false;
@@ -179,43 +237,73 @@ function fmgSeed() {
   const businesses = [
     { id: "biz_kasese_electro", name: "Kasese Electro Hub", email: "kasese.electro@example.com", password: "demo1234",
       category: "electronics", location: "kampala", bio: "Phones, accessories and home electronics at fair prices.",
-      joined: "2026-02-11", freeTrial: true, trialEndsAt: "2026-08-11" },
+      joined: "2026-02-11", freeTrial: true, trialEndsAt: "2026-08-11",
+      paymentMethods: { momo: { enabled: true, number: "+256 701 222 333" }, airtel: { enabled: false, number: "" },
+                         mastercard: { enabled: true, merchantId: "KEH-MC-001" } } },
     { id: "biz_masaka_threads", name: "Masaka Threads", email: "masaka.threads@example.com", password: "demo1234",
       category: "fashion", location: "masaka", bio: "Locally tailored fashion for men, women and children.",
-      joined: "2026-03-02", freeTrial: true, trialEndsAt: "2026-09-02" },
+      joined: "2026-03-02", freeTrial: true, trialEndsAt: "2026-09-02",
+      paymentMethods: { momo: { enabled: true, number: "+256 772 444 555" }, airtel: { enabled: true, number: "+256 752 444 555" },
+                         mastercard: { enabled: false, merchantId: "" } } },
     { id: "biz_gayaza_office", name: "Gayaza Office Supplies", email: "gayaza.office@example.com", password: "demo1234",
       category: "office", location: "gayaza", bio: "Stationery, furniture and printing supplies for every office.",
-      joined: "2026-04-18", freeTrial: true, trialEndsAt: "2026-10-18" },
+      joined: "2026-04-18", freeTrial: true, trialEndsAt: "2026-10-18",
+      paymentMethods: { momo: { enabled: true, number: "+256 703 666 777" }, airtel: { enabled: false, number: "" },
+                         mastercard: { enabled: true, merchantId: "GOS-MC-014" } } },
     { id: "biz_kyotera_agro", name: "Kyotera Agro Machines", email: "kyotera.agro@example.com", password: "demo1234",
       category: "machinery", location: "kyotera", bio: "Farm machinery, irrigation tools and spare parts.",
-      joined: "2026-01-27", freeTrial: true, trialEndsAt: "2026-07-27" }
+      joined: "2026-01-27", freeTrial: true, trialEndsAt: "2026-07-27",
+      paymentMethods: { momo: { enabled: true, number: "+256 782 888 999" }, airtel: { enabled: true, number: "+256 754 888 999" },
+                         mastercard: { enabled: false, merchantId: "" } } }
   ];
+
+  // Demo delivery/pickup coverage per seeded business (matches the "Delivery & pickup" section) —
+  // gives the checkout flow real fee data to compute against in a fresh demo.
+  const bizLocations = {
+    biz_kasese_electro: ["kampala", "gayaza"],
+    biz_masaka_threads: ["masaka", "kumasaka", "ssembabule"],
+    biz_gayaza_office: ["gayaza", "kampala"],
+    biz_kyotera_agro: ["kyotera", "masaka"]
+  };
+  Object.entries(bizLocations).forEach(([bizId, locs]) => fmgSave("fmg_biz_locations_" + bizId, locs));
 
   const products = [
     { name: "Dual-SIM Smartphone", category: "electronics", bizId: "biz_kasese_electro", price: 620000, discount: 10, stock: 24,
-      desc: "6.5\" display, 128GB storage, dual camera. Great value entry smartphone." },
+      desc: "6.5\" display, 128GB storage, dual camera. Great value entry smartphone.",
+      deliveryEnabled: true, deliveryFees: { kampala: 5000, gayaza: 7000 } },
     { name: "Bluetooth Speaker", category: "electronics", bizId: "biz_kasese_electro", price: 95000, discount: 0, stock: 40,
-      desc: "Portable speaker with 12-hour battery life and deep bass." },
+      desc: "Portable speaker with 12-hour battery life and deep bass.",
+      deliveryEnabled: true, deliveryFees: { kampala: 3000, gayaza: 4000 } },
     { name: "Solar Charging Kit", category: "electronics", bizId: "biz_kasese_electro", price: 180000, discount: 15, stock: 12,
-      desc: "Solar panel with two USB ports, ideal for areas with unreliable power." },
+      desc: "Solar panel with two USB ports, ideal for areas with unreliable power.",
+      deliveryEnabled: false, deliveryFees: {} },
     { name: "Men's Tailored Suit", category: "fashion", bizId: "biz_masaka_threads", price: 260000, discount: 0, stock: 8,
-      desc: "Made-to-measure two-piece suit, locally tailored in Masaka." },
+      desc: "Made-to-measure two-piece suit, locally tailored in Masaka.",
+      deliveryEnabled: true, deliveryFees: { masaka: 2000, kumasaka: 2000, ssembabule: 6000 } },
     { name: "Ankara Print Dress", category: "fashion", bizId: "biz_masaka_threads", price: 85000, discount: 20, stock: 15,
-      desc: "Vibrant Ankara print, available in multiple sizes." },
+      desc: "Vibrant Ankara print, available in multiple sizes.",
+      deliveryEnabled: true, deliveryFees: { masaka: 2000, kumasaka: 2000, ssembabule: 6000 } },
     { name: "Kids School Uniform Set", category: "fashion", bizId: "biz_masaka_threads", price: 45000, discount: 0, stock: 30,
-      desc: "Durable school uniform set, sizes for ages 5 to 14." },
+      desc: "Durable school uniform set, sizes for ages 5 to 14.",
+      deliveryEnabled: false, deliveryFees: {} },
     { name: "Office Desk (1.2m)", category: "office", bizId: "biz_gayaza_office", price: 310000, discount: 5, stock: 10,
-      desc: "Sturdy wood-finish office desk with drawer storage." },
+      desc: "Sturdy wood-finish office desk with drawer storage.",
+      deliveryEnabled: true, deliveryFees: { gayaza: 8000, kampala: 10000 } },
     { name: "Ream of A4 Paper (5-pack)", category: "office", bizId: "biz_gayaza_office", price: 60000, discount: 0, stock: 100,
-      desc: "High quality 80gsm printing paper, five reams." },
+      desc: "High quality 80gsm printing paper, five reams.",
+      deliveryEnabled: true, deliveryFees: { gayaza: 2000, kampala: 4000 } },
     { name: "Ergonomic Office Chair", category: "office", bizId: "biz_gayaza_office", price: 220000, discount: 12, stock: 18,
-      desc: "Adjustable height, lumbar support, mesh back." },
+      desc: "Adjustable height, lumbar support, mesh back.",
+      deliveryEnabled: false, deliveryFees: {} },
     { name: "Water Pump (2 inch)", category: "machinery", bizId: "biz_kyotera_agro", price: 540000, discount: 0, stock: 6,
-      desc: "Petrol-powered water pump for irrigation, 2-inch outlet." },
+      desc: "Petrol-powered water pump for irrigation, 2-inch outlet.",
+      deliveryEnabled: false, deliveryFees: {} },
     { name: "Maize Milling Machine", category: "machinery", bizId: "biz_kyotera_agro", price: 2400000, discount: 8, stock: 3,
-      desc: "Diesel-powered milling machine, 200kg/hour capacity." },
+      desc: "Diesel-powered milling machine, 200kg/hour capacity.",
+      deliveryEnabled: false, deliveryFees: {} },
     { name: "Hand Hoe Set (10-pack)", category: "machinery", bizId: "biz_kyotera_agro", price: 150000, discount: 0, stock: 25,
-      desc: "Ten durable hand hoes for farm and garden work." }
+      desc: "Ten durable hand hoes for farm and garden work.",
+      deliveryEnabled: true, deliveryFees: { kyotera: 3000, masaka: 6000 } }
   ];
 
   const seededBiz = businesses.map(b => ({ ...b, role: "business" }));
@@ -228,6 +316,8 @@ function fmgSeed() {
     discount: p.discount,
     stock: p.stock,
     desc: p.desc,
+    deliveryEnabled: !!p.deliveryEnabled,
+    deliveryFees: p.deliveryFees || {},
     image: fmgPlaceholder(p.category, p.name),
     createdAt: new Date().toISOString(),
     views: Math.floor(Math.random() * 300) + 20
@@ -238,12 +328,12 @@ function fmgSeed() {
   fmgSave("fmg_users", []);
   fmgSave("fmg_orders", []);
   fmgSave("fmg_cart", []);
+  fmgSave("fmg_threads", []);
   fmgSave("fmg_feedback", [
-    { id: fmgId("fb"), from: "user", name: "Grace N.", message: "I love how easy it is to find fashion items from Masaka sellers!", createdAt: "2026-05-02" },
-    { id: fmgId("fb"), from: "business", name: "Gayaza Office Supplies", message: "Could you add a bulk-order discount option?", createdAt: "2026-05-14" }
+    { id: fmgId("fb"), from: "user", name: "Grace N.", message: "I love how easy it is to find fashion items from Masaka sellers!", createdAt: "2026-05-02" }
   ]);
   fmgSave("fmg_traffic", fmgGenerateTraffic());
-  fmgSave("fmg_payment_accounts", { momo: "+256 700 000 000 (GROUP A KU MASAKA)", mastercard: "Merchant ID: KUM-2026-FMG-001" });
+  fmgSave("fmg_payment_accounts", { momo: "+256 700 000 000 (GROUP A KU MASAKA)", airtel: "+256 750 000 000 (GROUP A KU MASAKA)", mastercard: "Merchant ID: KUM-2026-FMG-001" });
   fmgSave("fmg_registered_business_count", businesses.length);
   fmgSave("fmg_seeded", true);
 }
@@ -283,6 +373,9 @@ const FMG = {
   getFeedback() { return fmgLoad("fmg_feedback", []); },
   saveFeedback(list) { fmgSaveSynced("fmg_feedback", "fmg_feedback", list); },
 
+  getThreads() { return fmgLoad("fmg_threads", []); },
+  saveThreads(list) { fmgSaveSynced("fmg_threads", "fmg_threads", list); },
+
   getTraffic() { return fmgLoad("fmg_traffic", []); },
 
   getPaymentAccounts() { return fmgLoad("fmg_payment_accounts", {}); },
@@ -298,6 +391,58 @@ const FMG = {
   businessById(id) { return this.getBusinesses().find(b => b.id === id); },
   locationById(id) { return FMG_LOCATIONS.find(l => l.id === id); },
   categoryById(id) { return FMG_CATEGORIES.find(c => c.id === id); },
+
+  paymentMethods: FMG_PAYMENT_METHODS,
+  emptyPaymentMethods: fmgEmptyPaymentMethods,
+  maxDeliveryFee: FMG_MAX_DELIVERY_FEE,
+
+  // Payment methods a single business actually has switched on AND filled in an account for.
+  businessOfferedMethods(biz) {
+    const pm = (biz && biz.paymentMethods) || fmgEmptyPaymentMethods();
+    return FMG_PAYMENT_METHODS.filter(m => {
+      const entry = pm[m.id] || {};
+      return entry.enabled && String(entry[m.field] || "").trim().length > 0;
+    }).map(m => m.id);
+  },
+
+  // The payment methods every business represented in this cart can accept in common —
+  // a shopper can only check out together if there is at least one shared method.
+  commonOfferedMethods(cart) {
+    const products = this.getProducts();
+    const businesses = this.getBusinesses();
+    const bizIds = new Set();
+    cart.forEach(c => {
+      const p = products.find(x => x.id === c.productId);
+      if (p) bizIds.add(p.bizId);
+    });
+    if (bizIds.size === 0) return [];
+    let common = null;
+    bizIds.forEach(id => {
+      const biz = businesses.find(b => b.id === id);
+      const offered = new Set(this.businessOfferedMethods(biz));
+      common = common === null ? offered : new Set([...common].filter(m => offered.has(m)));
+    });
+    return FMG_PAYMENT_METHODS.filter(m => common && common.has(m.id)).map(m => m.id);
+  },
+
+  // Delivery fee for one product to one location, clamped to the platform cap either way.
+  productDeliveryFee(product, locationId) {
+    if (!product || !product.deliveryEnabled || !locationId) return 0;
+    const fee = (product.deliveryFees || {})[locationId];
+    if (!fee || fee <= 0) return 0;
+    return Math.min(fee, FMG_MAX_DELIVERY_FEE);
+  },
+
+  // Total delivery fee for a cart at one chosen location: once per distinct product, not per unit.
+  cartDeliveryFee(cart, locationId) {
+    const products = this.getProducts();
+    let total = 0;
+    cart.forEach(c => {
+      const p = products.find(x => x.id === c.productId);
+      total += this.productDeliveryFee(p, locationId);
+    });
+    return total;
+  },
 
   placeholder: fmgPlaceholder,
   uid: fmgId,
