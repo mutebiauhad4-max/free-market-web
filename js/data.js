@@ -1,19 +1,6 @@
-/* ============================================================
-   CAMPUS MARKET — data.js
-   Shared data layer. By default everything is stored in the
-   browser via localStorage, which is enough to demo the site on
-   one device but is never shared between devices or browsers.
-
-   If js/firebase-config.js has FMG_CLOUD_ENABLED set to true, this
-   file also mirrors products, businesses, users, orders and
-   feedback to a free shared Firestore database in the background,
-   so every device sees the same marketplace. See firebase-config.js
-   for the 5-minute setup. Every other file only ever calls the FMG
-   object below — none of them know or care whether the data behind
-   it is local-only or cloud-synced.
-   ============================================================ */
-
 const FMG_ADMIN = { name: "ADMIN GROUP A", password: "KU MASAKA" };
+window.FMG_ADMIN = FMG_ADMIN;
+
 
 const FMG_CATEGORIES = [
   { id: "electronics", label: "Electronics", icon: "electronics" },
