@@ -3,9 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Business dashboard — THE FREE MARKET GLOBE</title>
+<title>Business dashboard — CAMPUS MARKET</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600;700&family=Work+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='9' fill='%2314110F'/%3E%3Cpath d='M11 25 L11 16 L20 10 L29 16 L29 25' stroke='%23E8A93B' stroke-width='2.6' fill='none' stroke-linejoin='round' stroke-linecap='round'/%3E%3Cline x1='9' y1='25' x2='31' y2='25' stroke='%23E8A93B' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="css/style.css">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 </head>
@@ -13,7 +14,7 @@
 
 <div class="dash-shell">
   <aside class="dash-sidebar">
-    <div class="brand"><span class="brand-mark" style="font-size:1.2rem;">FREE MARKET GLOBE</span></div>
+    <div class="brand"><span class="brand-mark" style="font-size:0.98rem;white-space:nowrap;">CAMPUS MARKET</span></div>
     <nav class="dash-nav">
       <a href="#" data-section="sec-overview" class="active">Overview</a>
       <a href="#" data-section="sec-products">Products</a>
@@ -24,11 +25,11 @@
       <a href="#" data-section="sec-sales">Sales per month</a>
       <div class="divider"></div>
       <a href="#" data-section="sec-locations">Delivery &amp; pickup</a>
+      <a href="#" data-section="sec-payment-methods">Payment methods</a>
       <a href="#" data-section="sec-chatbot">Chat assistant</a>
-      <a href="#" data-section="sec-payments">Payment methods</a>
       <a href="#" data-section="sec-messages">Messages &amp; feedback</a>
       <div class="divider"></div>
-      <a href="index.html" id="publicSiteBtn" target="_blank" rel="noopener">View public site</a>
+      <a href="index.html">View public site</a>
       <button id="logoutBtn">Log out</button>
     </nav>
   </aside>
@@ -111,22 +112,19 @@
       <div class="panel">
         <h3>Delivery &amp; pickup locations</h3>
         <p class="sub" style="margin-top:-6px;">Choose where you can deliver to or offer pickup from. Selected points show on the map and are offered to shoppers at checkout.</p>
-        <div id="locationSettingsList"></div>
         <div class="location-list" id="locationChips"></div>
         <div id="map" style="margin-top:16px;"></div>
       </div>
     </section>
 
-    <!-- PAYMENTS -->
-    <section id="sec-payments" class="dash-section hidden">
-      <div class="panel" style="max-width:720px;">
-        <h3>Payment methods offered by this business</h3>
-        <p class="sub" style="margin-top:-6px;">Customers will only see payment methods that you enable here. Enter the account or merchant details that the customer should use.</p>
-        <div class="field-row">
-          <div class="field"><label><input type="checkbox" id="payMomoEnabled"> MTN MoMo Pay</label><input id="payMomoAccount" placeholder="MTN MoMo number"></div>
-          <div class="field"><label><input type="checkbox" id="payAirtelEnabled"> Airtel Pay</label><input id="payAirtelAccount" placeholder="Airtel Money number"></div>
-        </div>
-        <div class="field"><label><input type="checkbox" id="payCardEnabled"> Mastercard</label><input id="payCardAccount" placeholder="Merchant / payment account reference"></div>
+    <!-- PAYMENT METHODS -->
+    <section id="sec-payment-methods" class="dash-section hidden">
+      <div class="panel" style="max-width:480px;">
+        <h3>Payment methods you accept</h3>
+        <p class="sub" style="margin-top:-6px;">Shoppers only see a payment option at checkout once it's switched
+        on here AND has an account number filled in. If a shopper's cart mixes products from businesses with no
+        payment method in common, checkout will ask them to split the order.</p>
+        <div id="paymentMethodsForm"></div>
         <button class="btn btn-primary" id="paymentMethodsSaveBtn">Save payment methods</button>
       </div>
     </section>
@@ -188,7 +186,15 @@
           <div class="field"><label>Stock quantity</label><input id="pfStock" type="number" min="0"></div>
         </div>
         <div class="field"><label>Description</label><textarea id="pfDesc"></textarea></div>
-        <div class="field"><label>Product delivery / pickup points</label><div id="productDeliverySettings" class="location-settings-grid"></div><p class="form-note">Delivery fee is capped at UGX 10,000 per selected point. A fee of 0 can be used for pickup.</p></div>
+        <div class="field">
+          <label style="display:flex;align-items:center;gap:8px;">
+            <input type="checkbox" id="pfDeliveryEnabled" style="width:auto;"> Offer delivery for this product
+          </label>
+        </div>
+        <div id="deliveryFeeSection" class="hidden">
+          <p class="form-note">Set a delivery fee for each town you serve (max UGX 10,000).</p>
+          <div id="deliveryFeeInputs"></div>
+        </div>
       </div>
     </div>
     <div id="productFormError" class="error-text hidden" style="margin-top:6px;"></div>
@@ -196,6 +202,11 @@
   </div>
 </div>
 
+<!-- Optional shared-database sync: see js/firebase-config.js for the free 5-minute setup.
+     Harmless to leave in even if you never turn it on. -->
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+<script src="js/firebase-config.js"></script>
 <script src="js/data.js"></script>
 <script>
   document.getElementById("pfCategory") && (document.getElementById("pfCategory").innerHTML = FMG.categories.map(c => `<option value="${c.id}">${c.label}</option>`).join(""));
