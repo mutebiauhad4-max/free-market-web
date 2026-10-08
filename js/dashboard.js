@@ -1,278 +1,492 @@
-/* ==========================================================================
-   BUSINESS AI — in-site assistant powered by Google Gemini (see ai-config.js)
-   - Answers business / shopping questions without the visitor leaving the site
-   - Can look at a product's picture (or a photo the shopper attaches)
-   - Remembers each shopper's conversation (per account, on this device)
-   ========================================================================== */
-(function () {
-  const CFG = (typeof BUSINESS_AI_CONFIG !== "undefined") ? BUSINESS_AI_CONFIG : { enabled: false };
-  const MAX_STORED = 60;      // messages kept in memory per shopper
-  const CONTEXT_TURNS = 14;   // recent messages sent to Gemini each time
-  let pendingImage = null;    // { mime, data(base64), label }
-  let busy = false;
+/* ============================================================
+   CAMPUS MARKET — dashboard.js (business dashboard)
+   ============================================================ */
 
-  /* ---------- memory ---------- */
-  function memoryKey() {
-    const s = FMG.getSession();
-    if (s && s.id) return "fmg_ai_chat_" + s.type + "_" + s.id;
-    let g = localStorage.getItem("fmg_ai_guest_id");
-    if (!g) { g = "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); localStorage.setItem("fmg_ai_guest_id", g); }
-    return "fmg_ai_chat_guest_" + g;
-  }
-  function loadHistory() { try { return JSON.parse(localStorage.getItem(memoryKey())) || []; } catch (e) { return []; } }
-  function saveHistory(h) { try { localStorage.setItem(memoryKey(), JSON.stringify(h.slice(-MAX_STORED))); } catch (e) {} }
+let CURRENT_BIZ = null;
+let selectedLocations = [];
 
-  /* ---------- UI helpers ---------- */
-  const $ = id => document.getElementById(id);
-  function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
-  function fmt(text) {   // safe mini-markdown: escape first, then **bold**, `-` bullets, line breaks
-    return esc(text).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-      .replace(/^\s*[-*]\s+/gm, "• ").replace(/\n/g, "<br>");
+function guardBusinessSession() {
+  const session = FMG.getSession();
+  if (!session || session.type !== "business") {
+    window.location.href = "index.html";
+    return null;
   }
-  function addBubble(role, text, opts) {
-    const body = $("baiBody");
-    const d = document.createElement("div");
-    d.className = "bai-msg " + role;
-    d.innerHTML = fmt(text);
-    if (opts && opts.imageSrc) { const im = document.createElement("img"); im.src = opts.imageSrc; d.prepend(im); }
-    body.appendChild(d);
-    body.scrollTop = body.scrollHeight;
-    return d;
-  }
-  function renderHistory() {
-    const body = $("baiBody");
-    body.innerHTML = "";
-    const h = loadHistory();
-    if (!h.length) {
-      addBubble("bot", "Hello, I'm the **Business AI**. Ask me about products, prices, which seller to choose, delivery, payments, or how to grow a small business. You can also attach a photo and I'll tell you what I see.");
-    } else {
-      h.forEach(m => { const b = addBubble(m.role === "user" ? "user" : "bot", m.text, m.hadImage ? {} : undefined); if (m.by) { const t = document.createElement("div"); t.className = "bai-by"; t.textContent = "via " + m.by; b.appendChild(t); } });
-    }
-    $("baiClearBtn").style.display = h.length ? "" : "none";
-  }
+  const biz = FMG.businessById(session.id);
+  if (!biz) { FMG.clearSession(); window.location.href = "index.html"; return null; }
+  return biz;
+}
 
-  /* ---------- marketplace knowledge sent as context ---------- */
-  function catalogueContext() {
-    const biz = FMG.getBusinesses();
-    const products = FMG.getProducts().slice(0, 60).map(p => {
-      const b = biz.find(x => x.id === p.bizId);
-      const price = p.discount ? Math.round(p.price * (1 - p.discount / 100)) : p.price;
-      return `- ${p.name} | ${FMG.categoryById(p.category)?.label || p.category} | UGX ${price}` +
-        (p.discount ? ` (${p.discount}% off)` : "") + ` | seller: ${b ? b.name : "unknown"}` +
-        (b ? ` (${FMG.locationById(b.location)?.label || ""})` : "") + (p.description ? ` | ${String(p.description).slice(0, 120)}` : "");
-    }).join("\n");
-    return products || "(no products listed yet)";
-  }
-  function systemPrompt() {
-    return [
-      "You are Business AI, the built-in assistant of CAMPUS MARKET, an online marketplace built by Group A, Kampala University Masaka, serving shoppers and small businesses in Uganda (prices in UGX).",
-      "Scope: ONLY business and shopping topics: products, comparing quality and value, pricing, choosing sellers, delivery and pickup, payments, running or growing a small business, marketing, stock, and customer service. Politely decline unrelated requests and steer back to business.",
-      "Style: professional, warm, concise (usually under 150 words). Use short bullet points for comparisons. Never invent products or prices: for items sold on CAMPUS MARKET use ONLY the catalogue below; for general market knowledge say it is general guidance.",
-      "Platform facts: payment methods are MTN MoMo, Airtel Pay and Mastercard and the checkout only offers methods every seller in the cart accepts; delivery fee per product never exceeds UGX 10,000; shoppers can use 'Message seller' on a product page; registering a business is free for the first 100 sign-ups for 6 months.",
-      "If asked to look at an image, describe what is visible and relate it to buying, quality, or selling advice. Do not claim certainty about authenticity or exact condition from a photo.",
-      "CURRENT CATALOGUE:\n" + catalogueContext()
-    ].join("\n\n");
-  }
+function trialStatus(biz) {
+  if (!biz.freeTrial) return { active: false, label: "Standard subscription", expired: false };
+  const today = new Date();
+  const end = new Date(biz.trialEndsAt);
+  const active = today <= end;
+  const daysLeft = Math.max(0, Math.ceil((end - today) / 86400000));
+  return { active, expired: !active, label: active ? `Free trial · ${daysLeft} days left` : "Free trial ended", daysLeft };
+}
 
-  /* ---------- provider router (many free AI services, automatic fallback) ---------- */
-  function isActive(p) {
-    if (CFG.proxyUrl && p.viaProxy) return true;
-    return !!(p.apiKey && String(p.apiKey).trim());
-  }
-  function activeProviders() { return (CFG.providers || []).filter(isActive); }
-  function aiReady() { return CFG.enabled && activeProviders().length > 0; }
-  let rr = 0;   // rotates the first choice in "spread" mode
-
-  async function fetchJSON(url, headers, body) {
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), CFG.timeoutMs || 20000);
-    try {
-      const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: ctl.signal });
-      if (!r.ok) { const tx = await r.text().catch(() => ""); const e = new Error("HTTP " + r.status + " " + tx.slice(0, 160)); e.status = r.status; throw e; }
-      return await r.json();
-    } finally { clearTimeout(t); }
-  }
-  // sends either straight to the provider, or via your own proxy server (keys stay private there)
-  function send_(p, url, headers, body) {
-    if (CFG.proxyUrl && p.viaProxy) return fetchJSON(CFG.proxyUrl, { "Content-Type": "application/json" }, { provider: p.id, model: p.model, payload: body });
-    return fetchJSON(url, headers, body);
-  }
-
-  async function askGemini(p, history, imagePart) {
-    const recent = history.slice(-CONTEXT_TURNS);
-    const contents = recent.map((m, i) => {
-      const parts = [{ text: m.text }];
-      if (i === recent.length - 1 && imagePart) parts.push({ inline_data: { mime_type: imagePart.mime, data: imagePart.data } });
-      return { role: m.role === "user" ? "user" : "model", parts };
-    });
-    const body = { system_instruction: { parts: [{ text: systemPrompt() }] }, contents, generationConfig: { temperature: 0.5, maxOutputTokens: 700 } };
-    const url = "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(p.model) + ":generateContent";
-    const headers = { "Content-Type": "application/json", "x-goog-api-key": p.apiKey || "" };
-    let data;
-    if (p.search) {
-      try { data = await send_(p, url, headers, Object.assign({}, body, { tools: [{ google_search: {} }] })); }
-      catch (e) { if (e.status === 400) data = await send_(p, url, headers, body); else throw e; }
-    } else data = await send_(p, url, headers, body);
-    const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
-    return parts ? parts.map(x => x.text || "").join("").trim() : "";
-  }
-
-  async function askOpenAICompatible(p, history, imagePart) {
-    const recent = history.slice(-CONTEXT_TURNS);
-    const msgs = [{ role: "system", content: systemPrompt() }].concat(recent.map((m, i) => {
-      const role = m.role === "user" ? "user" : "assistant";
-      if (i === recent.length - 1 && imagePart && p.vision) {
-        return { role, content: [{ type: "text", text: m.text }, { type: "image_url", image_url: { url: "data:" + imagePart.mime + ";base64," + imagePart.data } }] };
+function bizProducts() { return FMG.getProducts().filter(p => p.bizId === CURRENT_BIZ.id); }
+function bizOrderLines() {
+  const products = bizProducts();
+  const ids = new Set(products.map(p => p.id));
+  const lines = [];
+  FMG.getOrders().forEach(order => {
+    order.items.forEach(item => {
+      if (ids.has(item.productId)) {
+        const p = products.find(x => x.id === item.productId);
+        const price = p.discount ? Math.round(p.price * (1 - p.discount / 100)) : p.price;
+        lines.push({ orderId: order.id, date: order.createdAt, productName: p.name, qty: item.qty, revenue: price * item.qty, location: order.location });
       }
-      return { role, content: m.text };
-    }));
-    const headers = { "Content-Type": "application/json", "Authorization": "Bearer " + (p.apiKey || "") };
-    if (p.id === "openrouter") { headers["HTTP-Referer"] = location.origin; headers["X-Title"] = "CAMPUS MARKET"; }
-    const data = await send_(p, p.url, headers, { model: p.model, messages: msgs, temperature: 0.5, max_tokens: 700 });
-    const c = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-    return (typeof c === "string" ? c : "").trim();
+    });
+  });
+  return lines;
+}
+
+/* ---------- section switching ---------- */
+function showSection(id) {
+  document.querySelectorAll(".dash-section").forEach(s => s.classList.add("hidden"));
+  document.getElementById(id).classList.remove("hidden");
+  document.querySelectorAll(".dash-nav a").forEach(a => a.classList.toggle("active", a.dataset.section === id));
+  if (id === "sec-progression") renderProgressionChart();
+  if (id === "sec-sales") renderSalesChart();
+  if (id === "sec-locations") setTimeout(initMap, 50);
+}
+
+/* ---------- overview ---------- */
+function renderOverview() {
+  const products = bizProducts();
+  const lines = bizOrderLines();
+  const revenue = lines.reduce((s, l) => s + l.revenue, 0);
+  const unitsSold = lines.reduce((s, l) => s + l.qty, 0);
+  const lowStock = products.filter(p => p.stock > 0 && p.stock <= 5).length;
+  document.getElementById("kpiRevenue").textContent = money(revenue);
+  document.getElementById("kpiProducts").textContent = products.length;
+  document.getElementById("kpiUnits").textContent = unitsSold;
+  document.getElementById("kpiLowStock").textContent = lowStock;
+
+  const notes = fmgLoad("fmg_biz_notifications", []).filter(n => n.bizId === CURRENT_BIZ.id).slice(0, 6);
+  document.getElementById("notificationList").innerHTML = notes.length
+    ? notes.map(n => `<li>${n.message} <span style="color:rgba(33,26,22,0.5);font-size:0.76rem;">· ${new Date(n.at).toLocaleString()}</span></li>`).join("")
+    : "<li>No notifications yet — they will appear here when shoppers add your products to cart.</li>";
+}
+
+/* ---------- products ---------- */
+function renderProductsTable() {
+  const products = bizProducts();
+  const tbody = document.getElementById("productsTableBody");
+  if (products.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6">No products yet. Use "Upload product" to add your first listing.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = products.map(p => {
+    const badge = p.stock === 0 ? '<span class="badge-chip badge-out">Out of stock</span>' :
+      (p.stock <= 5 ? '<span class="badge-chip badge-low">Low stock</span>' : '<span class="badge-chip badge-in">In stock</span>');
+    return `<tr>
+      <td><img src="${p.image}" alt="${p.name}" style="width:44px;height:44px;object-fit:cover;border-radius:3px;"></td>
+      <td>${p.name}<br><span style="color:rgba(33,26,22,0.55);font-size:0.78rem;">${FMG.categoryById(p.category)?.label || p.category}</span></td>
+      <td>${money(p.price)}${p.discount ? ` <span style="color:var(--navy);">(-${p.discount}%)</span>` : ""}</td>
+      <td>${p.stock} ${badge}</td>
+      <td>${p.views || 0}</td>
+      <td>
+        <button class="btn btn-outline-dark btn-sm" onclick="openProductForm('${p.id}')">Edit</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteBizProduct('${p.id}')">Delete</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+function deleteBizProduct(id) {
+  if (!confirm("Remove this product from your storefront?")) return;
+  FMG.saveProducts(FMG.getProducts().filter(p => p.id !== id));
+  renderProductsTable();
+  renderOverview();
+}
+
+let editingProductId = null;
+let pendingImageDataUrl = null;
+
+function openProductForm(id) {
+  editingProductId = id || null;
+  pendingImageDataUrl = null;
+  const p = id ? FMG.getProducts().find(x => x.id === id) : null;
+  document.getElementById("productFormTitle").textContent = p ? "Edit product" : "Upload product";
+  document.getElementById("pfName").value = p ? p.name : "";
+  document.getElementById("pfCategory").value = p ? p.category : FMG.categories[0].id;
+  document.getElementById("pfPrice").value = p ? p.price : "";
+  document.getElementById("pfDiscount").value = p ? p.discount : 0;
+  document.getElementById("pfStock").value = p ? p.stock : "";
+  document.getElementById("pfDesc").value = p ? p.desc : "";
+  document.getElementById("uploadPreview").src = p ? p.image : FMG.placeholder(FMG.categories[0].id, "New");
+  document.getElementById("pfDeliveryEnabled").checked = p ? !!p.deliveryEnabled : false;
+  renderDeliveryFeeInputs(p ? p.deliveryFees || {} : {});
+  toggleDeliveryFeeInputs();
+  document.getElementById("productFormOverlay").classList.remove("hidden");
+}
+function closeProductForm() { document.getElementById("productFormOverlay").classList.add("hidden"); }
+
+// The fee list only offers the towns this business already ticked in "Delivery & pickup" (section 7.6),
+// so a business can't promise a fee for a point it doesn't actually serve.
+function renderDeliveryFeeInputs(existingFees) {
+  const bizLocationIds = fmgLoad("fmg_biz_locations_" + CURRENT_BIZ.id, [CURRENT_BIZ.location]);
+  const box = document.getElementById("deliveryFeeInputs");
+  if (bizLocationIds.length === 0) {
+    box.innerHTML = `<p class="form-note">You haven't selected any delivery/pickup towns yet — add some under "Delivery & pickup" first.</p>`;
+    return;
+  }
+  box.innerHTML = bizLocationIds.map(locId => {
+    const loc = FMG.locationById(locId);
+    const fee = existingFees[locId] || 0;
+    return `<div class="field-row" style="align-items:end;">
+      <div class="field" style="margin-bottom:8px;"><label>${loc ? loc.label : locId}</label>
+        <input type="number" min="0" max="${FMG.maxDeliveryFee}" step="500" class="pf-delivery-fee" data-loc="${locId}" value="${fee}">
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function toggleDeliveryFeeInputs() {
+  document.getElementById("deliveryFeeSection").classList.toggle("hidden", !document.getElementById("pfDeliveryEnabled").checked);
+}
+
+function handleImageSelect(input) {
+  const file = input.files[0];
+  if (!file) return;
+  // Resize/compress client-side so uploads never bloat the page or slow the site down.
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const img = new Image();
+    img.onload = () => {
+      const maxDim = 700;
+      let { width, height } = img;
+      if (width > height && width > maxDim) { height *= maxDim / width; width = maxDim; }
+      else if (height > maxDim) { width *= maxDim / height; height = maxDim; }
+      const canvas = document.createElement("canvas");
+      canvas.width = width; canvas.height = height;
+      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      pendingImageDataUrl = canvas.toDataURL("image/jpeg", 0.72);
+      document.getElementById("uploadPreview").src = pendingImageDataUrl;
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+function saveProductForm() {
+  const name = document.getElementById("pfName").value.trim();
+  const category = document.getElementById("pfCategory").value;
+  const price = Number(document.getElementById("pfPrice").value);
+  const discount = Number(document.getElementById("pfDiscount").value) || 0;
+  const stock = Number(document.getElementById("pfStock").value);
+  const desc = document.getElementById("pfDesc").value.trim();
+  const deliveryEnabled = document.getElementById("pfDeliveryEnabled").checked;
+  const errEl = document.getElementById("productFormError");
+  if (!name || !price || price <= 0 || isNaN(stock) || stock < 0) {
+    errEl.textContent = "Please fill in a product name, a price above zero, and stock quantity.";
+    errEl.classList.remove("hidden");
+    return;
   }
 
-  // Tries providers in turn. preferred = a provider id chosen by the shopper, or "auto".
-  async function askAI(history, imagePart, preferred) {
-    let list = activeProviders();
-    if (preferred && preferred !== "auto") {
-      const first = list.filter(p => p.id === preferred);
-      list = first.concat(list.filter(p => p.id !== preferred));     // chosen one first, others as backup
-    } else if (CFG.mode === "spread" && list.length > 1) {
-      const k = rr++ % list.length; list = list.slice(k).concat(list.slice(0, k));
-    }
-    if (imagePart) {                                                  // picture questions need a provider that can see
-      const seers = list.filter(p => p.vision); if (seers.length) list = seers;
-    }
-    const failures = [];
-    for (const p of list) {
-      try {
-        const text = p.type === "gemini" ? await askGemini(p, history, imagePart) : await askOpenAICompatible(p, history, imagePart);
-        if (text) return { text, by: p.name, id: p.id };
-        failures.push(p.name + ": empty answer");
-      } catch (e) { failures.push(p.name + ": " + e.message); }
-    }
-    const err = new Error("All providers failed"); err.failures = failures; throw err;
+  // Read the per-town delivery fees and hard-enforce the UGX 10,000 cap before saving anything.
+  const deliveryFees = {};
+  let feeError = "";
+  document.querySelectorAll(".pf-delivery-fee").forEach(input => {
+    const fee = Number(input.value) || 0;
+    if (fee > FMG.maxDeliveryFee) feeError = `Delivery fee for ${input.closest(".field").querySelector("label").textContent} cannot exceed UGX ${FMG.maxDeliveryFee.toLocaleString()}.`;
+    if (fee > 0) deliveryFees[input.dataset.loc] = Math.min(fee, FMG.maxDeliveryFee);
+  });
+  if (deliveryEnabled && feeError) {
+    errEl.textContent = feeError;
+    errEl.classList.remove("hidden");
+    return;
   }
 
-  /* ---------- built-in answers (used when no AI service is configured or reachable) ---------- */
-  function builtInAnswer(q) {
-    const t = q.toLowerCase();
-    let places = "our pickup and delivery points";
-    try { places = FMG.locations.map(l => l.label).join(", "); } catch (e) {}
-    if (/^\s*(hi|hello|hey|good (morning|afternoon|evening))\b/.test(t)) return "Hello! I'm the Business AI. I can help with products, payments, delivery, discounts and starting a business on CAMPUS MARKET. What would you like to know?";
-    if (/deliver|pickup|pick up|shipping/.test(t)) return "We deliver to or offer pickup at: " + places + ". Choose your point at checkout. Some products add a small delivery fee (never more than UGX 10,000), shown before you pay.";
-    if (/pay|momo|airtel|card|mastercard|money/.test(t)) return "You can pay with MTN MoMo, Airtel Pay or Mastercard. Checkout only shows the methods that every seller in your cart accepts.";
-    if (/discount|offer|cheap|price/.test(t)) return "Look for the yellow discount badge on a product card; it shows the current price cut from that business. You can also use the search and category filters at the top to compare prices.";
-    if (/cart|order|checkout/.test(t)) return "Add items to your cart, then open the cart and choose your delivery or pickup point and payment method. The seller is notified so they can prepare your order.";
-    if (/business|sell|register|sign ?up|grow|marketing/.test(t)) return "Registering a business is free for the first 100 sign-ups, for 6 months. Tips to grow: use clear photos, price honestly, reply quickly through Messages, and keep stock updated.";
-    if (/human|agent|talk to|seller|message/.test(t)) return "Use \"Message seller\" on a product page, and check the Messages button at the top of the site for their reply.";
-    if (/best|recommend|quality|value/.test(t)) return "For the best value, compare similar products by price, seller and photos, and message the seller with any questions before buying. Smarter recommendations will be available once the AI services are connected.";
-    return "I can help with products, payments, delivery points, discounts and starting a business. What would you like to know?";
-  }
-
-  /* ---------- send flow ---------- */
-  async function send(textOverride) {
-    if (busy) return;
-    const input = $("baiInput");
-    const text = (textOverride || input.value).trim();
-    if (!text && !pendingImage) return;
-    const question = text || "What can you tell me about this picture?";
-    input.value = "";
-    const img = pendingImage; pendingImage = null; renderAttachChip();
-    const history = loadHistory();
-    history.push({ role: "user", text: question, at: Date.now(), hadImage: !!img });
-    saveHistory(history);
-    addBubble("user", question, img ? { imageSrc: "data:" + img.mime + ";base64," + img.data } : undefined);
-    $("baiClearBtn").style.display = "";
-    busy = true; $("baiSend").disabled = true;
-    const typing = addBubble("bot", "Researching…"); typing.classList.add("typing");
-    let answer, fellBack = false, by = "";
-    try {
-      if (!aiReady()) throw new Error("not-configured");
-      const res = await askAI(history, img, $("baiProvider") ? $("baiProvider").value : "auto"); answer = res.text; by = res.by;
-    } catch (err) {
-      if (err.message !== "not-configured") console.warn("Business AI fell back to built-in answers:", err.failures || err);
-      fellBack = true;
-      answer = builtInAnswer(question);
-      if (img) answer = "I can't analyse pictures right now, but " + answer.charAt(0).toLowerCase() + answer.slice(1);
-    }
-    typing.remove();
-    const bub = addBubble("bot", answer);
-    if (by) { const tag = document.createElement("div"); tag.className = "bai-by"; tag.textContent = "via " + by; bub.appendChild(tag); }
-    history.push({ role: "bot", text: answer, by: by, at: Date.now(), offline: fellBack });
-    saveHistory(history);
-    busy = false; $("baiSend").disabled = false; input.focus();
-  }
-
-  /* ---------- image attach (shopper photo or product photo) ---------- */
-  function renderAttachChip() {
-    const c = $("baiAttach");
-    if (!pendingImage) { c.classList.add("hidden"); c.innerHTML = ""; return; }
-    c.classList.remove("hidden");
-    c.innerHTML = '<img src="data:' + pendingImage.mime + ';base64,' + pendingImage.data + '" alt=""><span>' + esc(pendingImage.label) + '</span><button type="button" aria-label="Remove image">&times;</button>';
-    c.querySelector("button").onclick = () => { pendingImage = null; renderAttachChip(); };
-  }
-  function fileToImage(file) {
-    return new Promise((resolve, reject) => {
-      const fr = new FileReader();
-      fr.onerror = reject;
-      fr.onload = () => {
-        const im = new Image();
-        im.onerror = reject;
-        im.onload = () => {
-          const s = Math.min(1, 900 / Math.max(im.width, im.height));
-          const c = document.createElement("canvas"); c.width = Math.round(im.width * s); c.height = Math.round(im.height * s);
-          c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
-          resolve({ mime: "image/jpeg", data: c.toDataURL("image/jpeg", 0.8).split(",")[1], label: file.name || "photo" });
-        };
-        im.src = fr.result;
-      };
-      fr.readAsDataURL(file);
+  errEl.classList.add("hidden");
+  const products = FMG.getProducts();
+  if (editingProductId) {
+    const idx = products.findIndex(p => p.id === editingProductId);
+    products[idx] = { ...products[idx], name, category, price, discount, stock, desc, deliveryEnabled, deliveryFees,
+      image: pendingImageDataUrl || products[idx].image };
+  } else {
+    products.push({
+      id: FMG.uid("prod"), name, category, price, discount, stock, desc, bizId: CURRENT_BIZ.id,
+      deliveryEnabled, deliveryFees,
+      image: pendingImageDataUrl || FMG.placeholder(category, name),
+      createdAt: new Date().toISOString(), views: 0
     });
   }
+  FMG.saveProducts(products);
+  closeProductForm();
+  renderProductsTable();
+  renderOverview();
+  toast(editingProductId ? "Product updated." : "Product uploaded — now visible on the public site.");
+}
 
-  /* ---------- public: ask about a product (button on product page) ---------- */
-  window.askBusinessAIAboutProduct = function (productId) {
-    const p = FMG.getProducts().find(x => x.id === productId);
-    if (!p) return;
-    const ov = document.getElementById("productOverlay"); if (ov) ov.remove();
-    openPanel();
-    const b = FMG.businessById(p.bizId);
-    if (typeof p.image === "string" && p.image.indexOf("data:image") === 0) {
-      pendingImage = { mime: p.image.slice(5, p.image.indexOf(";")), data: p.image.split(",")[1], label: p.name };
-      renderAttachChip();
-    }
-    send("Tell me about \"" + p.name + "\" from " + (b ? b.name : "this seller") + ": what does the picture show, is the price fair, and what should I check before buying?");
-  };
-
-  function fillProviders() {
-    const sel = $("baiProvider"); if (!sel) return;
-    const keep = sel.value || "auto";
-    sel.innerHTML = '<option value="auto">Auto (best available)</option>' + activeProviders().map(p => '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>').join("");
-    sel.value = [...sel.options].some(o => o.value === keep) ? keep : "auto";
-    sel.parentElement.style.display = activeProviders().length > 1 ? "" : "none";
+/* ---------- orders / sales per month ---------- */
+function renderOrdersTable() {
+  const lines = bizOrderLines().sort((a, b) => new Date(b.date) - new Date(a.date));
+  const tbody = document.getElementById("ordersTableBody");
+  if (lines.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5">No sales yet.</td></tr>`;
+    return;
   }
-  function openPanel() { fillProviders(); $("baiPanel").classList.remove("hidden"); $("baiToggle").classList.add("hidden"); renderHistory(); }
-  function closePanel() { $("baiPanel").classList.add("hidden"); $("baiToggle").classList.remove("hidden"); }
+  tbody.innerHTML = lines.map(l => `
+    <tr>
+      <td>${new Date(l.date).toLocaleDateString()}</td>
+      <td>${l.productName}</td>
+      <td>${l.qty}</td>
+      <td>${FMG.locationById(l.location)?.label || l.location}</td>
+      <td>${money(l.revenue)}</td>
+    </tr>`).join("");
+}
 
-  document.addEventListener("DOMContentLoaded", () => {
-    if (!$("baiPanel")) return;
-    $("baiToggle").onclick = openPanel;
-    $("baiCloseBtn").onclick = closePanel;
-    $("baiSend").onclick = () => send();
-    $("baiInput").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
-    $("baiPhotoBtn").onclick = () => $("baiFile").click();
-    $("baiFile").onchange = async e => {
-      const f = e.target.files[0]; e.target.value = "";
-      if (!f || !/^image\//.test(f.type)) return;
-      try { pendingImage = await fileToImage(f); renderAttachChip(); } catch (_) { FMG && typeof showToast === "function" && showToast("Couldn't read that image."); }
-    };
-    $("baiClearBtn").onclick = () => { if (confirm("Delete your chat history with Business AI on this device?")) { localStorage.removeItem(memoryKey()); renderHistory(); } };
-    document.querySelectorAll(".bai-quick button").forEach(b => b.onclick = () => send(b.textContent));
-    // switching account (login/logout) loads that person's own conversation
-    window.addEventListener("storage", e => { if (e.key === "fmg_session" && !$("baiPanel").classList.contains("hidden")) renderHistory(); });
+function monthKey(d) { const dt = new Date(d); return dt.getFullYear() + "-" + String(dt.getMonth() + 1).padStart(2, "0"); }
+function monthLabel(key) {
+  const [y, m] = key.split("-");
+  return new Date(y, m - 1, 1).toLocaleString("default", { month: "short", year: "2-digit" });
+}
+
+function monthlyRevenueSeries() {
+  const lines = bizOrderLines();
+  const map = {};
+  const now = new Date();
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    map[monthKey(d)] = 0;
+  }
+  lines.forEach(l => { const k = monthKey(l.date); if (k in map) map[k] += l.revenue; });
+  // Demo baseline so a fresh business still sees a meaningful trend line.
+  Object.keys(map).forEach((k, idx) => { if (map[k] === 0) map[k] = Math.round(150000 + idx * 60000 + Math.random() * 90000); });
+  return Object.entries(map).map(([k, v]) => ({ label: monthLabel(k), value: v }));
+}
+
+let progressionChart, salesChart;
+function renderProgressionChart() {
+  const series = monthlyRevenueSeries();
+  const ctx = document.getElementById("progressionCanvas").getContext("2d");
+  if (progressionChart) progressionChart.destroy();
+  progressionChart = new Chart(ctx, {
+    type: "line",
+    data: { labels: series.map(s => s.label), datasets: [{ label: "Revenue (UGX)", data: series.map(s => s.value), borderColor: "#E8A93B", backgroundColor: "rgba(232,169,59,0.18)", fill: true, tension: 0.3 }] },
+    options: { plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: v => (v / 1000) + "k" } } } }
   });
-  window.businessAIRefresh = function () { if ($("baiPanel") && !$("baiPanel").classList.contains("hidden")) renderHistory(); };
-})();
+}
+function renderSalesChart() {
+  const series = monthlyRevenueSeries();
+  const ctx = document.getElementById("salesCanvas").getContext("2d");
+  if (salesChart) salesChart.destroy();
+  salesChart = new Chart(ctx, {
+    type: "bar",
+    data: { labels: series.map(s => s.label), datasets: [{ label: "Sales (UGX)", data: series.map(s => s.value), backgroundColor: "#1B2A4A" }] },
+    options: { plugins: { legend: { display: false } }, scales: { y: { ticks: { callback: v => (v / 1000) + "k" } } } }
+  });
+}
+
+/* ---------- income statement / balance sheet ---------- */
+function renderFinance() {
+  const lines = bizOrderLines();
+  const revenue = lines.reduce((s, l) => s + l.revenue, 0);
+  const cogs = Math.round(revenue * 0.6);
+  const grossProfit = revenue - cogs;
+  const status = trialStatus(CURRENT_BIZ);
+  const platformFeeRate = status.active ? 0 : 0.05;
+  const platformFee = Math.round(revenue * platformFeeRate);
+  const netProfit = grossProfit - platformFee;
+
+  document.getElementById("incomeStatement").innerHTML = `
+    <table class="data-table">
+      <tr><td>Sales revenue</td><td style="text-align:right;">${money(revenue)}</td></tr>
+      <tr><td>Estimated cost of goods sold</td><td style="text-align:right;">(${money(cogs)})</td></tr>
+      <tr><th>Gross profit</th><th style="text-align:right;">${money(grossProfit)}</th></tr>
+      <tr><td>Platform fee ${status.active ? "(waived — free trial)" : "(5%)"}</td><td style="text-align:right;">(${money(platformFee)})</td></tr>
+      <tr><th>Net profit</th><th style="text-align:right;">${money(netProfit)}</th></tr>
+    </table>
+    <p class="form-note">Cost of goods and fees are estimates for demonstration. Connect real accounting figures once a backend is in place.</p>`;
+
+  const products = bizProducts();
+  const inventoryValue = products.reduce((s, p) => s + p.price * p.stock, 0);
+  const cash = revenue;
+  const totalAssets = inventoryValue + cash;
+  const liabilities = status.expired ? Math.round(revenue * 0.05) : 0;
+  const equity = totalAssets - liabilities;
+
+  document.getElementById("balanceSheet").innerHTML = `
+    <table class="data-table">
+      <tr><th colspan="2">Assets</th></tr>
+      <tr><td>Cash from sales</td><td style="text-align:right;">${money(cash)}</td></tr>
+      <tr><td>Inventory on hand (at listed price)</td><td style="text-align:right;">${money(inventoryValue)}</td></tr>
+      <tr><th>Total assets</th><th style="text-align:right;">${money(totalAssets)}</th></tr>
+      <tr><th colspan="2">Liabilities &amp; equity</th></tr>
+      <tr><td>Platform fees owed</td><td style="text-align:right;">${money(liabilities)}</td></tr>
+      <tr><th>Owner's equity</th><th style="text-align:right;">${money(equity)}</th></tr>
+    </table>`;
+}
+
+/* ---------- delivery & pickup locations ---------- */
+function renderLocationChips() {
+  selectedLocations = fmgLoad("fmg_biz_locations_" + CURRENT_BIZ.id, [CURRENT_BIZ.location]);
+  const list = document.getElementById("locationChips");
+  list.innerHTML = FMG.locations.map(l => `
+    <button type="button" class="location-chip ${selectedLocations.includes(l.id) ? "selected" : ""}" data-loc="${l.id}">${l.label}</button>`).join("");
+  list.querySelectorAll(".location-chip").forEach(btn => {
+    btn.onclick = () => {
+      const loc = btn.dataset.loc;
+      if (selectedLocations.includes(loc)) selectedLocations = selectedLocations.filter(x => x !== loc);
+      else selectedLocations.push(loc);
+      fmgSave("fmg_biz_locations_" + CURRENT_BIZ.id, selectedLocations);
+      btn.classList.toggle("selected");
+      initMap();
+    };
+  });
+}
+
+let bizMap = null;
+function initMap() {
+  const el = document.getElementById("map");
+  if (!el || typeof L === "undefined") return;
+  if (bizMap) { bizMap.remove(); bizMap = null; }
+  bizMap = L.map("map").setView([0.0, 31.9], 8);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    attribution: "&copy; OpenStreetMap contributors", maxZoom: 17
+  }).addTo(bizMap);
+  FMG.locations.forEach(loc => {
+    const active = selectedLocations.includes(loc.id);
+    const marker = L.circleMarker([loc.lat, loc.lng], {
+      radius: active ? 9 : 6, color: active ? "#E8A93B" : "#1B2A4A", fillColor: active ? "#E8A93B" : "#1B2A4A", fillOpacity: 0.85
+    }).addTo(bizMap);
+    marker.bindPopup(`<strong>${loc.label}</strong><br>${active ? "Active pickup/delivery point" : "Not selected"}`);
+  });
+}
+
+/* ---------- messages: two-way threads with shoppers ---------- */
+function renderMessages() {
+  const threads = FMG.getThreads().filter(t => t.bizId === CURRENT_BIZ.id)
+    .sort((a, b) => new Date(b.messages.at(-1)?.at || b.createdAt) - new Date(a.messages.at(-1)?.at || a.createdAt));
+  const list = document.getElementById("messagesList");
+  list.innerHTML = threads.length ? threads.map(t => `
+    <div class="panel" style="margin-bottom:10px;padding:14px 16px;">
+      <strong>${t.userName}</strong>
+      ${t.unreadForBiz ? '<span class="badge-chip badge-low" style="margin-left:6px;">New</span>' : ""}
+      <div style="max-height:180px;overflow-y:auto;margin:10px 0;display:flex;flex-direction:column;gap:6px;">
+        ${t.messages.map(m => `<div class="chat-msg ${m.from === "business" ? "user" : "bot"}" style="align-self:${m.from === "business" ? "flex-end" : "flex-start"};max-width:85%;">${m.text}</div>`).join("")}
+      </div>
+      <div style="display:flex;gap:8px;">
+        <input type="text" id="reply-${t.id}" placeholder="Write a reply..." style="flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:4px;">
+        <button class="btn btn-primary btn-sm" onclick="replyToThread('${t.id}')">Send</button>
+      </div>
+    </div>`).join("")
+    : `<p style="color:rgba(33,26,22,0.6);">No messages from shoppers yet — they'll appear here after using "Message seller" on one of your products.</p>`;
+}
+
+function replyToThread(threadId) {
+  const input = document.getElementById("reply-" + threadId);
+  const text = input.value.trim();
+  if (!text) return;
+  const threads = FMG.getThreads();
+  const idx = threads.findIndex(t => t.id === threadId);
+  if (idx === -1) return;
+  threads[idx].messages.push({ from: "business", text, at: new Date().toISOString() });
+  threads[idx].unreadForBiz = false;
+  threads[idx].unreadForUser = true; // this is what lets the shopper's browser pick up the reply
+  FMG.saveThreads(threads);
+  renderMessages();
+  toast("Reply sent to " + threads[idx].userName + ".");
+}
+
+/* ---------- chatbot settings ---------- */
+function renderChatbotSettings() {
+  const saved = fmgLoad("fmg_biz_chatbot_" + CURRENT_BIZ.id, { persona: "friendly", greeting: `Hi! Thanks for visiting ${CURRENT_BIZ.name}. How can I help?` });
+  document.getElementById("chatbotPersona").value = saved.persona;
+  document.getElementById("chatbotGreeting").value = saved.greeting;
+}
+function saveChatbotSettings() {
+  const persona = document.getElementById("chatbotPersona").value;
+  const greeting = document.getElementById("chatbotGreeting").value.trim();
+  fmgSave("fmg_biz_chatbot_" + CURRENT_BIZ.id, { persona, greeting });
+  toast("Chat assistant settings saved.");
+}
+
+/* ---------- payment methods this business accepts from shoppers ----------
+   Shown at public checkout via FMG.commonOfferedMethods() — a method only
+   counts as "offered" once it's both switched on AND has an account number
+   filled in, so a half-configured toggle can't be selected by a shopper. */
+function renderPaymentMethodsForm() {
+  const pm = CURRENT_BIZ.paymentMethods || FMG.emptyPaymentMethods();
+  const box = document.getElementById("paymentMethodsForm");
+  box.innerHTML = FMG.paymentMethods.map(m => {
+    const entry = pm[m.id] || { enabled: false, [m.field]: "" };
+    return `
+    <div class="field" style="border:1px solid var(--line);border-radius:4px;padding:12px 14px;margin-bottom:10px;">
+      <label style="display:flex;align-items:center;gap:8px;font-size:0.95rem;">
+        <input type="checkbox" id="pm-${m.id}-enabled" ${entry.enabled ? "checked" : ""} style="width:auto;">
+        ${m.label}
+      </label>
+      <input type="text" id="pm-${m.id}-value" placeholder="${m.fieldLabel}" value="${entry[m.field] || ""}" style="margin-top:8px;">
+    </div>`;
+  }).join("");
+}
+
+function savePaymentMethodsForm() {
+  const paymentMethods = {};
+  FMG.paymentMethods.forEach(m => {
+    const enabled = document.getElementById(`pm-${m.id}-enabled`).checked;
+    const value = document.getElementById(`pm-${m.id}-value`).value.trim();
+    paymentMethods[m.id] = { enabled, [m.field]: value };
+  });
+  const businesses = FMG.getBusinesses();
+  const idx = businesses.findIndex(b => b.id === CURRENT_BIZ.id);
+  businesses[idx] = { ...businesses[idx], paymentMethods };
+  FMG.saveBusinesses(businesses);
+  CURRENT_BIZ = businesses[idx];
+  toast("Payment methods saved — shoppers will see whichever ones have an account number filled in.");
+}
+
+/* ---------- bootstrap ---------- */
+document.addEventListener("DOMContentLoaded", () => {
+  CURRENT_BIZ = guardBusinessSession();
+  if (!CURRENT_BIZ) return;
+
+  document.getElementById("bizNameLabel").textContent = CURRENT_BIZ.name;
+  const status = trialStatus(CURRENT_BIZ);
+  const pill = document.getElementById("trialPill");
+  pill.textContent = status.label;
+  pill.classList.toggle("expired", status.expired);
+
+  renderOverview();
+  renderProductsTable();
+  renderOrdersTable();
+  renderFinance();
+  renderLocationChips();
+  renderMessages();
+  renderChatbotSettings();
+  renderPaymentMethodsForm();
+
+  document.querySelectorAll(".dash-nav a[data-section]").forEach(a => {
+    a.addEventListener("click", (e) => { e.preventDefault(); showSection(a.dataset.section); });
+  });
+  document.getElementById("logoutBtn").onclick = logout;
+  document.getElementById("addProductBtn").onclick = () => openProductForm(null);
+  document.getElementById("productFormClose").onclick = closeProductForm;
+  document.getElementById("productFormSave").onclick = saveProductForm;
+  document.getElementById("imageInput").addEventListener("change", (e) => handleImageSelect(e.target));
+  document.getElementById("chatbotSaveBtn").onclick = saveChatbotSettings;
+  document.getElementById("pfDeliveryEnabled").addEventListener("change", toggleDeliveryFeeInputs);
+  document.getElementById("paymentMethodsSaveBtn").onclick = savePaymentMethodsForm;
+
+  showSection("sec-overview");
+
+  // When cloud sync is on, another device's changes (a shopper's order landing,
+  // an admin edit, etc.) arrive here in the background — keep the numbers fresh.
+  document.addEventListener("fmg:updated", (e) => {
+    if (!CURRENT_BIZ) return;
+    if (e.detail.key === "fmg_businesses") {
+      const refreshed = FMG.businessById(CURRENT_BIZ.id);
+      if (refreshed) CURRENT_BIZ = refreshed;
+    }
+    if (e.detail.key === "fmg_threads") renderMessages();
+    renderOverview();
+    renderProductsTable();
+    renderOrdersTable();
+    renderFinance();
+    renderMessages();
+  });
+});
