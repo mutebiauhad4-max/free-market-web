@@ -1,6 +1,19 @@
-const FMG_ADMIN = { name: "ADMIN GROUP A", password: "KU MASAKA" };
-window.FMG_ADMIN = FMG_ADMIN;
+/* ============================================================
+   CAMPUS MARKET — data.js
+   Shared data layer. By default everything is stored in the
+   browser via localStorage, which is enough to demo the site on
+   one device but is never shared between devices or browsers.
 
+   If js/firebase-config.js has FMG_CLOUD_ENABLED set to true, this
+   file also mirrors products, businesses, users, orders and
+   feedback to a free shared Firestore database in the background,
+   so every device sees the same marketplace. See firebase-config.js
+   for the 5-minute setup. Every other file only ever calls the FMG
+   object below — none of them know or care whether the data behind
+   it is local-only or cloud-synced.
+   ============================================================ */
+
+const FMG_ADMIN = { name: "ADMIN GROUP A", password: "KU MASAKA" };
 
 const FMG_CATEGORIES = [
   { id: "electronics", label: "Electronics", icon: "electronics" },
@@ -472,77 +485,7 @@ const FMG = {
     fmgSave("fmg_registered_business_count", next);
     fmgSyncMetaToCloud("registered_business_count", next);
     return n < FMG_FREE_TRIAL_LIMIT;
- 
-}
-/* ---------- Global FMG Data Controller API Hooks ---------- */
-
-window.FMG = {
-  // Read categories array
-  getCategories: () => FMG_CATEGORIES,
-  
-  // Read locations array
-  getLocations: () => FMG_LOCATIONS,
-
-  // 1. BUSINESS READ/WRITE HOOKS
-  getBusinesses: () => fmgLoad("fmg_registered_businesses", []),
-  
-  saveBusiness: function(businessData) {
-    let businesses = this.getBusinesses();
-    
-    // Generate a unique fallback ID if it's a completely new signup
-    if (!businessData.id) businessData.id = fmgId("biz");
-    
-    // Check if the business already exists to update it, or add a new one
-    const index = businesses.findIndex(b => b.id === businessData.id);
-    if (index >= 0) {
-      businesses[index] = businessData;
-    } else {
-      businesses.push(businessData);
-    }
-    
-    // This saves locally AND updates the Firestore collection automatically!
-    fmgSaveSynced("businesses", "fmg_registered_businesses", businesses);
-    return businessData.id;
-  },
-
-  // 2. PRODUCT CATALOG READ/WRITE HOOKS
-  getProducts: () => fmgLoad("fmg_products", []),
-  
-  saveProduct: function(productData) {
-    let products = this.getProducts();
-    if (!productData.id) productData.id = fmgId("prod");
-    
-    const index = products.findIndex(p => p.id === productData.id);
-    if (index >= 0) {
-      products[index] = productData;
-    } else {
-      products.push(productData);
-    }
-    
-    fmgSaveSynced("products", "fmg_products", products);
-    return productData.id;
   }
-};
-
-/* ---------- Cloud Synchronization Lifecycle Initializer ---------- */
-async function fmgInitCloudSync() {
-  // Bypasses if configuration variables are turned off
-  if (!window.fmgCloudReady || !window.fmgDB) return;
-  
-  fmgDB = window.fmgDB;
-  fmgCloudReady = true;
-  
-  console.log("Synchronizing data nodes with Cloud Firestore instance...");
-  
-  // Guard localized data against race overwrites and spin listeners
-  await fmgSeedCollectionIfEmpty("businesses", "fmg_registered_businesses");
-  await fmgSeedCollectionIfEmpty("products", "fmg_products");
-  
-  // Attach continuous live push notifications
-  fmgWatchList("businesses", "fmg_registered_businesses");
-  fmgWatchList("products", "fmg_products");
-}
-
 };
 
 fmgSeed();
